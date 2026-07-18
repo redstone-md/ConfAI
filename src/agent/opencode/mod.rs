@@ -71,6 +71,10 @@ impl Agent for OpenCode {
         &self.info
     }
 
+    fn skills_dir(&self) -> Option<PathBuf> {
+        self.info.config_path.parent().map(|dir| dir.join("skills"))
+    }
+
     fn load(&self) -> Result<Box<dyn AgentConfig>> {
         let root = json::load(&self.info.config_path)?;
         // A missing or unreadable credential file must not stop the config being

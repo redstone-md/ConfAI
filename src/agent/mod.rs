@@ -69,6 +69,15 @@ pub trait Agent {
     /// Parse the agent's config into an editable view.
     fn load(&self) -> Result<Box<dyn AgentConfig>>;
 
+    /// Where this agent looks for skills, if it has them at all.
+    ///
+    /// Skills are directories rather than config keys, so this is a path and
+    /// not a parsed value. Codex has no equivalent — its plugins are a separate
+    /// mechanism — so the default is that there are none.
+    fn skills_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
     fn detect(&self) -> Detection {
         let info = self.info();
         Detection {

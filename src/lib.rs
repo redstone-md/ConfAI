@@ -17,6 +17,7 @@ pub mod domain;
 pub mod mcp;
 pub mod net;
 pub mod preset;
+pub mod skill;
 pub mod store;
 pub mod tui;
 pub mod ui;

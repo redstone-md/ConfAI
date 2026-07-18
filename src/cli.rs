@@ -53,6 +53,10 @@ pub enum Command {
     #[command(subcommand)]
     Preset(PresetCommand),
 
+    /// List, check and move the skills an agent has installed.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+
     /// List, add, remove and check the MCP servers an agent launches.
     #[command(subcommand)]
     Mcp(McpCommand),
@@ -177,6 +181,52 @@ pub enum ProviderCommand {
         /// Print what would change without writing it.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// List the skills installed for the selected agents.
+    #[command(visible_alias = "ls")]
+    List {
+        #[command(flatten)]
+        target: Target,
+    },
+
+    /// Report skills the agent will silently ignore.
+    Doctor {
+        #[command(flatten)]
+        target: Target,
+    },
+
+    /// Copy a skill from one agent to another.
+    Copy {
+        /// Directory name of the skill.
+        name: String,
+        /// Agent to take it from.
+        #[arg(long, value_name = "AGENT")]
+        from: String,
+        /// Agent to install it into. Omit to install into every other agent.
+        #[arg(long, value_name = "AGENT")]
+        to: Option<String>,
+        /// Replace it if the destination already has a skill by that name.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Delete a skill from an agent.
+    #[command(visible_alias = "rm")]
+    Remove {
+        name: String,
+        /// Agent to delete it from. Required: this removes a directory.
+        #[arg(long, value_name = "AGENT")]
+        agent: String,
+    },
+
+    /// Print where each agent keeps its skills.
+    Path {
+        #[command(flatten)]
+        target: Target,
     },
 }
 

@@ -53,6 +53,10 @@ impl Agent for Claude {
         &self.info
     }
 
+    fn skills_dir(&self) -> Option<PathBuf> {
+        self.info.config_path.parent().map(|dir| dir.join("skills"))
+    }
+
     fn load(&self) -> Result<Box<dyn AgentConfig>> {
         let root = json::load(&self.info.config_path)?;
         // MCP servers are not in settings.json but in ~/.claude.json, which also

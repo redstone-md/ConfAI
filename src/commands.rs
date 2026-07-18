@@ -1,5 +1,6 @@
 //! Command implementations. The CLI and the TUI both end up here.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -7,12 +8,14 @@ use anyhow::{bail, Context, Result};
 use crate::agent::{self, Agent, AgentConfig};
 use crate::brand;
 use crate::cli::{
-    Command, McpCommand, McpPresetCommand, PresetCommand, ProviderCommand, ProviderFields, Target,
+    Command, McpCommand, McpPresetCommand, PresetCommand, ProviderCommand, ProviderFields,
+    SkillCommand, Target,
 };
 use crate::domain::{mask, Provider, WireApi};
 use crate::mcp;
 use crate::net;
 use crate::preset;
+use crate::skill;
 use crate::store;
 use crate::ui::{self, Table};
 
@@ -22,6 +25,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Provider(cmd) => provider(cmd),
         Command::Preset(cmd) => preset_command(cmd),
         Command::Mcp(cmd) => mcp_command(cmd),
+        Command::Skill(cmd) => skill_command(cmd),
         Command::Model { model, target } => model_command(model, &target),
         Command::Path { target } => paths(&target),
         Command::Edit { target } => edit(&target),
@@ -535,6 +539,162 @@ fn sync_into(
 
     let pruned = if prune { config.prune_models(id, &served)? } else { 0 };
     Ok(SyncOutcome { written, pruned })
+}
+
+fn skill_command(command: SkillCommand) -> Result<()> {
+    match command {
+        SkillCommand::List { target } => skill_list(&target),
+        SkillCommand::Doctor { target } => skill_doctor(&target),
+        SkillCommand::Copy { name, from, to, force } => {
+            skill_copy(&name, &from, to.as_deref(), force)
+        }
+        SkillCommand::Remove { name, agent } => skill_remove(&name, &agent),
+        SkillCommand::Path { target } => skill_paths(&target),
+    }
+}
+
+/// Agents that keep skills at all, with the directory they keep them in.
+fn skill_agents(target: &Target) -> Result<Vec<(Box<dyn Agent>, PathBuf)>> {
+    let agents: Vec<(Box<dyn Agent>, PathBuf)> = resolve(target)?
+        .into_iter()
+        .filter_map(|entry| entry.skills_dir().map(|dir| (entry, dir)))
+        .collect();
+    if agents.is_empty() {
+        bail!("no selected agent keeps skills");
+    }
+    Ok(agents)
+}
+
+fn skill_list(target: &Target) -> Result<()> {
+    let mut table = Table::new(["agent", "skill", "ok", "description"]);
+
+    for (entry, dir) in skill_agents(target)? {
+        for skill in skill::read_dir(&dir) {
+            table.row([
+                entry.info().id.to_string(),
+                skill.directory.clone(),
+                if skill.is_healthy() { ui::green("yes") } else { ui::red("no") },
+                ui::truncate(&skill.summary(), 68),
+            ]);
+        }
+    }
+
+    if table.is_empty() {
+        println!("{}", ui::dim("no skills installed"));
+        return Ok(());
+    }
+    print!("{}", table.render());
+    Ok(())
+}
+
+fn skill_doctor(target: &Target) -> Result<()> {
+    let mut problems = 0;
+
+    for (entry, dir) in skill_agents(target)? {
+        let skills = skill::read_dir(&dir);
+        println!("{} {}", ui::bold(entry.info().name), ui::dim(&dir.display().to_string()));
+        if skills.is_empty() {
+            println!("  {} no skills installed", ui::dim("·"));
+            continue;
+        }
+
+        for skill in skills {
+            match &skill.problem {
+                None => println!("  {} {}", ui::green("✓"), skill.directory),
+                Some(problem) => {
+                    problems += 1;
+                    println!("  {} {:<24} {}", ui::red("✗"), skill.directory, ui::red(problem));
+                }
+            }
+        }
+    }
+
+    if problems == 0 {
+        println!("\n{}", ui::green("every skill parses"));
+        return Ok(());
+    }
+    bail!("{problems} skill(s) the agent will not load as intended")
+}
+
+/// Copy a skill between agents, which is the whole point of listing them here:
+/// the same skill is useful to more than one agent and there is no shared place
+/// to put it.
+fn skill_copy(name: &str, from: &str, to: Option<&str>, force: bool) -> Result<()> {
+    let source_agent = agent::find(from)?;
+    let source_dir = source_agent
+        .skills_dir()
+        .with_context(|| format!("{} does not keep skills", source_agent.info().name))?
+        .join(name);
+
+    if !source_dir.is_dir() {
+        bail!("{} has no skill called {name:?}", source_agent.info().name);
+    }
+
+    let destinations: Vec<Box<dyn Agent>> = match to {
+        Some(to) => vec![agent::find(to)?],
+        None => agent::installed()
+            .into_iter()
+            .filter(|entry| entry.info().id != source_agent.info().id)
+            .collect(),
+    };
+
+    let mut copied_anywhere = false;
+    for entry in destinations {
+        let Some(dir) = entry.skills_dir() else { continue };
+        let target = dir.join(name);
+
+        match skill::copy(&source_dir, &target, force) {
+            Ok(files) => {
+                copied_anywhere = true;
+                println!(
+                    "{} copied {} to {} ({files} file{})",
+                    ui::green("✓"),
+                    ui::bold(name),
+                    entry.info().name,
+                    if files == 1 { "" } else { "s" }
+                );
+            }
+            Err(err) => eprintln!("{} {}: {err:#}", ui::yellow("!"), entry.info().name),
+        }
+    }
+
+    if !copied_anywhere {
+        bail!("{name:?} was not copied anywhere");
+    }
+    Ok(())
+}
+
+fn skill_remove(name: &str, agent_id: &str) -> Result<()> {
+    let entry = agent::find(agent_id)?;
+    let dir = entry
+        .skills_dir()
+        .with_context(|| format!("{} does not keep skills", entry.info().name))?
+        .join(name);
+
+    if !dir.is_dir() {
+        bail!("{} has no skill called {name:?}", entry.info().name);
+    }
+
+    // Skills are directories, and there is no backup for a directory the way
+    // there is for a config file, so say exactly what is going before doing it.
+    let files = skill::read_dir(dir.parent().unwrap_or(&dir))
+        .into_iter()
+        .find(|s| s.directory == name)
+        .map(|s| s.path)
+        .unwrap_or_else(|| dir.clone());
+    println!("{} removing {}", ui::yellow("!"), files.display());
+
+    std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    println!("{} removed {} from {}", ui::green("✓"), ui::bold(name), entry.info().name);
+    Ok(())
+}
+
+fn skill_paths(target: &Target) -> Result<()> {
+    for (entry, dir) in skill_agents(target)? {
+        let count = skill::read_dir(&dir).len();
+        println!("{:<14} {} {}", entry.info().id, dir.display(), ui::dim(&format!("({count})")));
+    }
+    Ok(())
 }
 
 fn mcp_command(command: McpCommand) -> Result<()> {

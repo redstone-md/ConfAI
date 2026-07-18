@@ -23,6 +23,8 @@ dirs = "6.0"
 ratatui = "0.30"
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
+# A maintained fork of serde_yaml, which is deprecated and would fail cargo-deny.
+serde_norway = "0.9"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 toml_edit = { version = "0.25", features = ["serde"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls", "json", "gzip"] }

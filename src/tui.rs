@@ -33,6 +33,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::agent::{self, Agent, AgentConfig, Capabilities, Detection};
 use crate::brand::{self, palette};
 use crate::domain::{mask, Model, Provider, WireApi};
+use crate::mcp;
 use crate::net::{self, catalog};
 use crate::preset::{self, Preset};
 use crate::ui;
@@ -260,27 +261,59 @@ struct Health {
     millis: u128,
 }
 
-/// Probe results for this session, keyed by the agent the provider belongs to.
+/// Probe results for this session, keyed by the agent the subject belongs to.
 ///
-/// The same provider id means different things under different agents, so the
-/// agent id is part of the key rather than an afterthought.
-#[derive(Debug, Default)]
-struct HealthCache {
-    entries: HashMap<(String, String), Health>,
+/// The same name means different things under different agents, so the agent id
+/// is part of the key rather than an afterthought. Providers and MCP servers
+/// each get their own cache of this type; the verdicts differ, the bookkeeping
+/// does not.
+#[derive(Debug)]
+struct HealthCache<T> {
+    entries: HashMap<(String, String), T>,
 }
 
-impl HealthCache {
-    fn get(&self, agent_id: &str, provider_id: &str) -> Option<Health> {
-        self.entries.get(&(agent_id.to_string(), provider_id.to_string())).copied()
+impl<T> Default for HealthCache<T> {
+    fn default() -> Self {
+        Self { entries: HashMap::new() }
+    }
+}
+
+impl<T> HealthCache<T> {
+    fn get(&self, agent_id: &str, subject: &str) -> Option<&T> {
+        self.entries.get(&(agent_id.to_string(), subject.to_string()))
     }
 
-    fn record(&mut self, agent_id: &str, provider_id: &str, health: Health) {
-        self.entries.insert((agent_id.to_string(), provider_id.to_string()), health);
+    fn record(&mut self, agent_id: &str, subject: &str, health: T) {
+        self.entries.insert((agent_id.to_string(), subject.to_string()), health);
     }
 
-    /// Drop what we knew, because the endpoint it described has changed.
-    fn forget(&mut self, agent_id: &str, provider_id: &str) {
-        self.entries.remove(&(agent_id.to_string(), provider_id.to_string()));
+    /// Drop what we knew, because the thing it described has changed.
+    fn forget(&mut self, agent_id: &str, subject: &str) {
+        self.entries.remove(&(agent_id.to_string(), subject.to_string()));
+    }
+}
+
+/// What the right-hand pane is showing for the selected agent.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Lens {
+    #[default]
+    Providers,
+    Mcp,
+}
+
+impl Lens {
+    fn other(self) -> Self {
+        match self {
+            Lens::Providers => Lens::Mcp,
+            Lens::Mcp => Lens::Providers,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Lens::Providers => "providers",
+            Lens::Mcp => "mcp",
+        }
     }
 }
 
@@ -315,6 +348,17 @@ impl Filter {
             || provider.display_name.as_deref().is_some_and(hit)
             || provider.models.iter().any(|model| hit(&model.id))
     }
+
+    /// The same idea over an MCP server: its name, its transport, or the command
+    /// line you would recognise it by.
+    fn matches_server(&self, server: &mcp::Server) -> bool {
+        let needle = self.query.trim().to_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        let hit = |hay: &str| hay.to_lowercase().contains(&needle);
+        hit(&server.name) || hit(server.transport.kind()) || hit(&server.transport.summary())
+    }
 }
 
 /// One agent as it looked the last time it was read from disk.
@@ -328,6 +372,7 @@ struct AgentEntry {
     active: Option<String>,
     /// The model the agent is set to use, for agents that name one.
     model: Option<String>,
+    mcp: Vec<mcp::Server>,
     /// Why the config could not be parsed, if it could not be.
     error: Option<String>,
 }
@@ -344,6 +389,7 @@ impl AgentEntry {
             providers: Vec::new(),
             active: None,
             model: None,
+            mcp: Vec::new(),
             error: None,
         };
         match handle.load() {
@@ -351,6 +397,7 @@ impl AgentEntry {
                 entry.providers = config.providers();
                 entry.active = config.active_provider();
                 entry.model = config.model();
+                entry.mcp = config.mcp_servers();
             }
             // A missing config for an agent that is not installed is expected,
             // not something to shout about in the list.
@@ -398,6 +445,17 @@ enum Action {
     },
     /// Apply a named preset, or `None` to open the picker.
     Preset(Option<String>),
+    /// Switch the right-hand pane, or `None` to toggle it.
+    Lens(Option<Lens>),
+    McpDetail,
+    McpAdd,
+    McpEdit,
+    McpDelete,
+    McpCheck,
+    McpCheckAll,
+    McpToggle,
+    /// Apply a named MCP preset, or `None` to open the picker.
+    McpPreset(Option<String>),
     Reload,
     Palette,
     Help,
@@ -419,10 +477,28 @@ fn menu() -> Vec<Action> {
         Action::Sync { prune: false },
         Action::Sync { prune: true },
         Action::Preset(None),
+        Action::Lens(None),
         Action::Reload,
         Action::Palette,
         Action::Help,
         Action::Quit,
+    ]
+}
+
+/// What the same keys mean while the pane is showing MCP servers.
+///
+/// The bindings are deliberately the ones they already are: `a` adds whatever
+/// the pane is listing. Only the meaning follows the lens.
+fn mcp_menu() -> Vec<Action> {
+    vec![
+        Action::McpDetail,
+        Action::McpToggle,
+        Action::McpAdd,
+        Action::McpEdit,
+        Action::McpDelete,
+        Action::McpCheck,
+        Action::McpCheckAll,
+        Action::McpPreset(None),
     ]
 }
 
@@ -444,6 +520,17 @@ impl Action {
             Action::Sync { prune: true } => "sync models and prune".into(),
             Action::Preset(Some(id)) => format!("preset {id}"),
             Action::Preset(None) => "apply a preset".into(),
+            Action::Lens(Some(lens)) => format!("show {}", lens.label()),
+            Action::Lens(None) => "switch between providers and mcp".into(),
+            Action::McpDetail => "mcp server detail".into(),
+            Action::McpAdd => "add mcp server".into(),
+            Action::McpEdit => "edit mcp server".into(),
+            Action::McpDelete => "delete mcp server".into(),
+            Action::McpCheck => "check mcp server".into(),
+            Action::McpCheckAll => "check all mcp servers".into(),
+            Action::McpToggle => "enable or disable mcp server".into(),
+            Action::McpPreset(Some(id)) => format!("mcp preset {id}"),
+            Action::McpPreset(None) => "apply an mcp preset".into(),
             Action::Reload => "reload from disk".into(),
             Action::Palette => "command palette".into(),
             Action::Help => "help".into(),
@@ -467,6 +554,15 @@ impl Action {
             Action::Sync { prune: false } => "sync",
             Action::Sync { prune: true } => "sync+prune",
             Action::Preset(_) => "preset",
+            Action::Lens(_) => "providers/mcp",
+            Action::McpDetail => "detail",
+            Action::McpAdd => "add",
+            Action::McpEdit => "edit",
+            Action::McpDelete => "del",
+            Action::McpCheck => "check",
+            Action::McpCheckAll => "check all",
+            Action::McpToggle => "on/off",
+            Action::McpPreset(_) => "preset",
             Action::Reload => "reload",
             Action::Palette => "commands",
             Action::Help => "help",
@@ -492,6 +588,19 @@ impl Action {
             }
             Action::Preset(Some(_)) => "apply this preset to the selected agent".into(),
             Action::Preset(None) => "choose a preset to apply".into(),
+            Action::Lens(Some(lens)) => {
+                format!("show this agent's {} in the right pane", lens.label())
+            }
+            Action::Lens(None) => "swap the right pane between providers and mcp servers".into(),
+            Action::McpDetail => "show the full command, arguments and environment".into(),
+            Action::McpAdd => "add an mcp server to this agent".into(),
+            Action::McpEdit => "change this server's command, url or environment".into(),
+            Action::McpDelete => "remove this mcp server from the config".into(),
+            Action::McpCheck => "check whether this server could start".into(),
+            Action::McpCheckAll => "check every mcp server of this agent in turn".into(),
+            Action::McpToggle => "turn this mcp server on or off without deleting it".into(),
+            Action::McpPreset(Some(_)) => "add this ready-made mcp server to the agent".into(),
+            Action::McpPreset(None) => "choose a ready-made mcp server to add".into(),
             Action::Reload => "re-read every config from disk".into(),
             Action::Palette => "search every action by name".into(),
             Action::Help => "the about screen and the full key map".into(),
@@ -516,6 +625,15 @@ impl Action {
             Action::Sync { prune: false } => "s",
             Action::Sync { prune: true } => "S",
             Action::Preset(_) => "p",
+            Action::Lens(_) => "v",
+            Action::McpDetail => "enter",
+            Action::McpAdd => "a",
+            Action::McpEdit => "e",
+            Action::McpDelete => "d",
+            Action::McpCheck => "c",
+            Action::McpCheckAll => "C",
+            Action::McpToggle => "u",
+            Action::McpPreset(_) => "p",
             Action::Reload => "r",
             Action::Palette => "ctrl+p or ctrl+k",
             Action::Help => "?",
@@ -530,6 +648,14 @@ impl Action {
     fn unavailable(&self, app: &App) -> Option<String> {
         let no_agent = || app.agent().is_none().then(|| "no agent selected".to_string());
         let no_provider = || app.provider().is_none().then(|| "no provider selected".to_string());
+        let no_server = || app.mcp_server().is_none().then(|| "no mcp server selected".to_string());
+        let no_mcp = || match app.agent() {
+            None => Some("no agent selected".to_string()),
+            Some(agent) if !agent.capabilities.mcp => {
+                Some(format!("{} does not store MCP servers", agent.name))
+            }
+            Some(_) => None,
+        };
 
         match self {
             Action::Quit | Action::Help | Action::Reload | Action::Palette | Action::Filter => None,
@@ -553,6 +679,20 @@ impl Action {
                 app.agent().filter(|agent| !agent.capabilities.per_provider_models).map(|agent| {
                     format!("{} stores no model list; press m to choose a model", agent.name)
                 })
+            }),
+
+            // Every shipped agent stores MCP servers, but the capability is what
+            // decides, not the fact that all three happen to today.
+            Action::Lens(_) | Action::McpAdd | Action::McpPreset(_) => no_mcp(),
+            Action::McpDetail
+            | Action::McpEdit
+            | Action::McpDelete
+            | Action::McpCheck
+            | Action::McpToggle => no_mcp().or_else(no_server),
+            Action::McpCheckAll => no_mcp().or_else(|| {
+                app.agent()
+                    .is_none_or(|agent| agent.mcp.is_empty())
+                    .then(|| "this agent has no mcp servers to check".to_string())
             }),
         }
     }
@@ -584,6 +724,27 @@ impl Action {
             }
             Action::Preset(Some(id)) => app.apply_preset_by_id(&id),
             Action::Preset(None) => app.open_presets(),
+
+            Action::Lens(target) => {
+                app.lens = target.unwrap_or_else(|| app.lens().other());
+                app.focus = Pane::Providers;
+                // The two lists have separate cursors, so neither loses its place
+                // when you look at the other one.
+                app.filter.clear();
+            }
+            Action::McpDetail => app.open_mcp_detail(),
+            Action::McpAdd => app.open_mcp_form(None),
+            Action::McpEdit => {
+                let existing = app.mcp_server().cloned();
+                app.open_mcp_form(existing);
+            }
+            Action::McpDelete => app.ask_delete_mcp(),
+            Action::McpCheck => app.schedule(Job::McpCheck, "checking…"),
+            Action::McpCheckAll => app.schedule(Job::McpCheckAll, "checking every mcp server…"),
+            Action::McpToggle => app.toggle_mcp(),
+            Action::McpPreset(Some(id)) => app.apply_mcp_preset_by_id(&id),
+            Action::McpPreset(None) => app.open_mcp_presets(),
+
             Action::Reload => {
                 app.reload();
                 app.say(Tone::Info, "reloaded from disk");
@@ -603,14 +764,29 @@ impl Action {
 
         // The bare forms of these only re-open what the palette already lists.
         actions.extend(menu().into_iter().filter(|action| {
-            !matches!(action, Action::Use(None) | Action::Preset(None) | Action::Palette)
+            !matches!(
+                action,
+                Action::Use(None) | Action::Preset(None) | Action::Palette | Action::Lens(None)
+            )
         }));
+        // Named rather than toggled, so searching "mcp" finds the way in.
+        actions.push(Action::Lens(Some(Lens::Providers)));
+        actions.push(Action::Lens(Some(Lens::Mcp)));
+        actions.extend(
+            mcp_menu().into_iter().filter(|action| !matches!(action, Action::McpPreset(None))),
+        );
 
         actions.extend(
             preset::all()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|entry| Action::Preset(Some(entry.id))),
+        );
+        actions.extend(
+            preset::mcp_all()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| Action::McpPreset(Some(entry.id))),
         );
         actions.extend(app.agents.iter().map(|agent| Action::SelectAgent(agent.id.clone())));
         actions
@@ -650,6 +826,11 @@ enum FieldKind {
     ApiKey,
     DisplayName,
     WireApi,
+    Name,
+    Command,
+    Args,
+    Url,
+    Env,
 }
 
 impl FieldKind {
@@ -660,6 +841,11 @@ impl FieldKind {
             FieldKind::ApiKey => "api key",
             FieldKind::DisplayName => "display name",
             FieldKind::WireApi => "wire api",
+            FieldKind::Name => "name",
+            FieldKind::Command => "command",
+            FieldKind::Args => "args",
+            FieldKind::Url => "url",
+            FieldKind::Env => "env (K=V …)",
         }
     }
 
@@ -667,6 +853,18 @@ impl FieldKind {
     /// they cannot be spelled wrong.
     fn is_choice(self) -> bool {
         matches!(self, FieldKind::WireApi)
+    }
+
+    /// The value as it may be shown while this field is not being typed into.
+    ///
+    /// Credentials are redacted here rather than at the call site, so a new
+    /// secret-bearing field cannot be added without deciding what it leaks.
+    fn redact(self, value: &str) -> String {
+        match self {
+            FieldKind::ApiKey => mask(value),
+            FieldKind::Env => mask_env(value),
+            _ => value.to_string(),
+        }
     }
 }
 
@@ -678,10 +876,21 @@ fn next_wire(current: &str) -> &'static str {
     WIRE_CHOICES[(at + 1) % WIRE_CHOICES.len()]
 }
 
-/// A small field editor over one provider.
+/// What a form is editing, so saving knows which builder to run it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subject {
+    Provider,
+    Mcp,
+}
+
+/// A small field editor.
+///
+/// The cursor, text entry and rendering are the same whether the subject is a
+/// provider or an MCP server; only the field set and the value it builds differ.
 #[derive(Debug, Clone)]
 struct Form {
     agent_id: String,
+    subject: Subject,
     /// The id being edited, or `None` when adding, in which case the id is a field.
     original_id: Option<String>,
     fields: Vec<(FieldKind, String)>,
@@ -695,6 +904,7 @@ impl Form {
     fn add(agent_id: impl Into<String>) -> Self {
         Self {
             agent_id: agent_id.into(),
+            subject: Subject::Provider,
             original_id: None,
             fields: vec![
                 (FieldKind::Id, String::new()),
@@ -712,6 +922,7 @@ impl Form {
     fn edit(agent_id: impl Into<String>, provider: &Provider) -> Self {
         Self {
             agent_id: agent_id.into(),
+            subject: Subject::Provider,
             original_id: Some(provider.id.clone()),
             fields: vec![
                 (FieldKind::BaseUrl, provider.base_url.clone().unwrap_or_default()),
@@ -728,10 +939,39 @@ impl Form {
         }
     }
 
+    /// An editor over an MCP server, or over a new one when `server` is `None`.
+    fn mcp(agent_id: impl Into<String>, server: Option<&mcp::Server>) -> Self {
+        let (command, args) = match server.map(|s| &s.transport) {
+            Some(mcp::Transport::Stdio { command, args }) => (command.clone(), args.join(" ")),
+            _ => (String::new(), String::new()),
+        };
+        let url = server.and_then(|s| s.transport.url()).unwrap_or_default().to_string();
+        let env = server
+            .map(|s| s.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+
+        Self {
+            agent_id: agent_id.into(),
+            subject: Subject::Mcp,
+            original_id: server.map(|s| s.name.clone()),
+            fields: vec![
+                (FieldKind::Name, server.map(|s| s.name.clone()).unwrap_or_default()),
+                (FieldKind::Command, command),
+                (FieldKind::Args, args),
+                (FieldKind::Url, url),
+                (FieldKind::Env, env),
+            ],
+            cursor: Cursor::default(),
+            editing: false,
+            buffer: String::new(),
+        }
+    }
+
     fn title(&self) -> String {
-        match &self.original_id {
-            Some(id) => format!("edit {id}"),
-            None => "add provider".to_string(),
+        match (&self.original_id, self.subject) {
+            (Some(id), _) => format!("edit {id}"),
+            (None, Subject::Provider) => "add provider".to_string(),
+            (None, Subject::Mcp) => "add mcp server".to_string(),
         }
     }
 
@@ -796,6 +1036,59 @@ impl Form {
         };
         Ok(provider)
     }
+
+    /// The MCP server this form describes, or why it is not usable yet.
+    fn server(&self) -> Result<mcp::Server> {
+        let name = match &self.original_id {
+            Some(name) => name.clone(),
+            None => self.value(FieldKind::Name).trim().to_string(),
+        };
+        if name.is_empty() {
+            anyhow::bail!("an MCP server needs a name");
+        }
+
+        let command = optional(self.value(FieldKind::Command));
+        let url = optional(self.value(FieldKind::Url));
+        // The CLI silently prefers the url; here there is room to say that the
+        // two describe different transports and only one can be meant.
+        let transport = match (command, url) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "give either a command or a url, not both: they are different transports"
+                )
+            }
+            (Some(command), None) => mcp::Transport::Stdio {
+                command,
+                args: self.value(FieldKind::Args).split_whitespace().map(str::to_owned).collect(),
+            },
+            (None, Some(url)) => mcp::Transport::Remote { url },
+            (None, None) => anyhow::bail!("give either a command or a url"),
+        };
+
+        let mut env = std::collections::BTreeMap::new();
+        for pair in self.value(FieldKind::Env).split_whitespace() {
+            let (key, value) = pair
+                .split_once('=')
+                .with_context(|| format!("env expects KEY=VALUE pairs, got {pair:?}"))?;
+            env.insert(key.trim().to_string(), value.trim().to_string());
+        }
+
+        // `enabled` is left alone: the toggle owns it, and a form that reset it
+        // would silently re-enable a server the user had turned off.
+        Ok(mcp::Server { name, transport, env, enabled: None })
+    }
+}
+
+/// `KEY=secret` rendered as `KEY=se…et`, for showing an env line without
+/// spilling the tokens in it.
+fn mask_env(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => format!("{key}={}", mask(value)),
+            None => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Trim and treat blank as absent, matching how the CLI reads optional flags.
@@ -809,11 +1102,18 @@ fn optional(raw: &str) -> Option<String> {
 struct Confirm {
     prompt: String,
     agent_id: String,
-    provider_id: String,
+    /// The provider or MCP server the answer applies to.
+    subject_id: String,
+    subject: Subject,
 }
 
 struct PresetPicker {
     presets: Vec<Preset>,
+    cursor: Cursor,
+}
+
+struct McpPresetPicker {
+    presets: Vec<preset::McpPreset>,
     cursor: Cursor,
 }
 
@@ -963,6 +1263,8 @@ enum Overlay {
     Presets(PresetPicker),
     Palette(CommandPalette),
     Models(ModelPicker),
+    McpDetail { scroll: u16 },
+    McpPresets(McpPresetPicker),
 }
 
 /// Work that must be visibly announced before it blocks the event loop.
@@ -972,6 +1274,8 @@ enum Job {
     CheckAll,
     /// Ask the endpoint what it serves, then offer the answer as a picker.
     Models,
+    McpCheck,
+    McpCheckAll,
     /// `prune` also drops models the endpoint no longer serves.
     Sync {
         prune: bool,
@@ -1012,9 +1316,16 @@ struct App {
     agents: Vec<AgentEntry>,
     agent_cursor: Cursor,
     provider_cursor: Cursor,
+    /// The MCP list keeps its own place, so switching lens and back does not
+    /// lose where you were.
+    mcp_cursor: Cursor,
     focus: Pane,
+    /// What the right pane is set to show. Read it through [`App::lens`], which
+    /// also honours whether the agent supports MCP at all.
+    lens: Lens,
     filter: Filter,
-    health: HealthCache,
+    health: HealthCache<Health>,
+    mcp_health: HealthCache<mcp::Health>,
     overlay: Option<Overlay>,
     status: Status,
     pending: Option<Job>,
@@ -1028,9 +1339,12 @@ impl App {
             agents: Vec::new(),
             agent_cursor: Cursor::default(),
             provider_cursor: Cursor::default(),
+            mcp_cursor: Cursor::default(),
             focus: Pane::Agents,
+            lens: Lens::default(),
             filter: Filter::default(),
             health: HealthCache::default(),
+            mcp_health: HealthCache::default(),
             overlay: None,
             status: Status::default(),
             pending: None,
@@ -1089,6 +1403,7 @@ impl App {
             agent::all().iter().map(|handle| AgentEntry::snapshot(handle.as_ref())).collect();
         self.agent_cursor.clamp(self.agents.len());
         self.provider_cursor.clamp(self.provider_count());
+        self.mcp_cursor.clamp(self.mcp_count());
     }
 
     fn agent(&self) -> Option<&AgentEntry> {
@@ -1109,6 +1424,42 @@ impl App {
 
     fn provider(&self) -> Option<&Provider> {
         self.visible_providers().get(self.provider_cursor.index()).copied()
+    }
+
+    /// The lens actually in force.
+    ///
+    /// An agent that stores no MCP servers never shows the MCP pane, whatever
+    /// the toggle was last set to, so selecting one cannot strand you on a pane
+    /// that has nothing to say.
+    fn lens(&self) -> Lens {
+        match self.agent() {
+            Some(agent) if agent.capabilities.mcp => self.lens,
+            _ => Lens::Providers,
+        }
+    }
+
+    /// The MCP servers the filter lets through, in config order.
+    fn visible_servers(&self) -> Vec<&mcp::Server> {
+        match self.agent() {
+            Some(agent) => agent.mcp.iter().filter(|s| self.filter.matches_server(s)).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn mcp_count(&self) -> usize {
+        self.visible_servers().len()
+    }
+
+    fn mcp_server(&self) -> Option<&mcp::Server> {
+        self.visible_servers().get(self.mcp_cursor.index()).copied()
+    }
+
+    /// How many rows the right pane is showing, whichever lens it is under.
+    fn right_count(&self) -> usize {
+        match self.lens() {
+            Lens::Providers => self.provider_count(),
+            Lens::Mcp => self.mcp_count(),
+        }
     }
 
     fn say(&mut self, tone: Tone, text: impl Into<String>) {
@@ -1133,6 +1484,7 @@ impl App {
             self.agents[index] = AgentEntry::snapshot(handle.as_ref());
         }
         self.provider_cursor.clamp(self.provider_count());
+        self.mcp_cursor.clamp(self.mcp_count());
     }
 
     /// Load the selected agent's config, apply `edit`, save, and re-snapshot.
@@ -1198,7 +1550,7 @@ impl App {
             _ => return,
         }
         // The list changed shape under the cursor; keep it on a real row.
-        self.provider_cursor.clamp(self.provider_count());
+        self.clamp_right();
     }
 
     fn on_browse_key(&mut self, key: KeyEvent) {
@@ -1215,7 +1567,7 @@ impl App {
             // Esc walks back one layer at a time rather than always quitting.
             KeyCode::Esc if self.filter.active() => {
                 self.filter.clear();
-                self.provider_cursor.clamp(self.provider_count());
+                self.clamp_right();
                 self.say(Tone::Info, "filter cleared");
             }
             KeyCode::Esc => self.dispatch(Action::Quit),
@@ -1224,22 +1576,38 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => self.focus = self.focus.other(),
             KeyCode::Left => self.focus = Pane::Agents,
             KeyCode::Right => self.focus = Pane::Providers,
-            KeyCode::Enter => self.dispatch(Action::Detail),
+            // These keys keep their meaning and change their subject: `a` adds
+            // whatever the right pane is listing.
+            KeyCode::Enter => self.dispatch(self.by_lens(Action::Detail, Action::McpDetail)),
+            KeyCode::Char('u') => self.dispatch(self.by_lens(Action::Use(None), Action::McpToggle)),
+            KeyCode::Char('e') => self.dispatch(self.by_lens(Action::Edit, Action::McpEdit)),
+            KeyCode::Char('a') => self.dispatch(self.by_lens(Action::Add, Action::McpAdd)),
+            KeyCode::Char('d') => self.dispatch(self.by_lens(Action::Delete, Action::McpDelete)),
+            KeyCode::Char('c') => self.dispatch(self.by_lens(Action::Check, Action::McpCheck)),
+            KeyCode::Char('C') => {
+                self.dispatch(self.by_lens(Action::CheckAll, Action::McpCheckAll))
+            }
+            KeyCode::Char('p') => {
+                self.dispatch(self.by_lens(Action::Preset(None), Action::McpPreset(None)))
+            }
+
             KeyCode::Char('/') => self.dispatch(Action::Filter),
             KeyCode::Char('?') => self.dispatch(Action::Help),
-            KeyCode::Char('u') => self.dispatch(Action::Use(None)),
+            KeyCode::Char('v') => self.dispatch(Action::Lens(None)),
             KeyCode::Char('m') => self.dispatch(Action::Models),
-            KeyCode::Char('e') => self.dispatch(Action::Edit),
-            KeyCode::Char('a') => self.dispatch(Action::Add),
-            KeyCode::Char('d') => self.dispatch(Action::Delete),
-            KeyCode::Char('c') => self.dispatch(Action::Check),
-            KeyCode::Char('C') => self.dispatch(Action::CheckAll),
             KeyCode::Char('s') => self.dispatch(Action::Sync { prune: false }),
             // Shift widens the same action, as it does for delete in most file managers.
             KeyCode::Char('S') => self.dispatch(Action::Sync { prune: true }),
-            KeyCode::Char('p') => self.dispatch(Action::Preset(None)),
             KeyCode::Char('r') => self.dispatch(Action::Reload),
             _ => {}
+        }
+    }
+
+    /// The variant of a shared binding that applies to the lens now in force.
+    fn by_lens(&self, providers: Action, mcp: Action) -> Action {
+        match self.lens() {
+            Lens::Providers => providers,
+            Lens::Mcp => mcp,
         }
     }
 
@@ -1271,17 +1639,22 @@ impl App {
             if index != self.agent_cursor.index() {
                 self.agent_cursor = Cursor { index };
                 self.provider_cursor = Cursor::default();
+                self.mcp_cursor = Cursor::default();
             }
             return;
         }
 
-        if let Some(index) = self.hits.provider_rows.row(at, self.provider_count()) {
+        if let Some(index) = self.hits.provider_rows.row(at, self.right_count()) {
             // Click to select, click the selected row again to open it.
-            let reopen = self.focus == Pane::Providers && index == self.provider_cursor.index();
+            let cursor = match self.lens() {
+                Lens::Providers => &mut self.provider_cursor,
+                Lens::Mcp => &mut self.mcp_cursor,
+            };
+            let reopen = self.focus == Pane::Providers && index == cursor.index();
+            *cursor = Cursor { index };
             self.focus = Pane::Providers;
-            self.provider_cursor = Cursor { index };
             if reopen {
-                self.dispatch(Action::Detail);
+                self.dispatch(self.by_lens(Action::Detail, Action::McpDetail));
             }
             return;
         }
@@ -1316,6 +1689,11 @@ impl App {
                     picker.cursor = Cursor { index };
                 }
             }
+            Some(Overlay::McpPresets(picker)) => {
+                if let Some(index) = rows.row(at, picker.presets.len()) {
+                    picker.cursor = Cursor { index };
+                }
+            }
             _ => {}
         }
     }
@@ -1335,6 +1713,8 @@ impl App {
                 Overlay::Presets(picker) => picker.cursor.step(delta, picker.presets.len()),
                 Overlay::Palette(palette) => palette.cursor.step(delta, palette.matches.len()),
                 Overlay::Models(picker) => picker.cursor.step(delta, picker.matches.len()),
+                Overlay::McpDetail { scroll } => *scroll = scrolled(*scroll),
+                Overlay::McpPresets(picker) => picker.cursor.step(delta, picker.presets.len()),
                 Overlay::Form(_) | Overlay::Confirm(_) => {}
             }
             return;
@@ -1344,19 +1724,33 @@ impl App {
         if self.hits.agents.contains(at) {
             self.agent_cursor.step(delta, self.agents.len());
             self.provider_cursor = Cursor::default();
+            self.mcp_cursor = Cursor::default();
         } else if self.hits.providers.contains(at) {
-            self.provider_cursor.step(delta, self.provider_count());
+            match self.lens() {
+                Lens::Providers => self.provider_cursor.step(delta, self.provider_count()),
+                Lens::Mcp => self.mcp_cursor.step(delta, self.mcp_count()),
+            }
         }
     }
 
     fn move_focused(&mut self, delta: isize) {
-        match self.focus {
-            Pane::Agents => {
+        match (self.focus, self.lens()) {
+            (Pane::Agents, _) => {
                 self.agent_cursor.step(delta, self.agents.len());
                 self.provider_cursor = Cursor::default();
+                self.mcp_cursor = Cursor::default();
             }
-            Pane::Providers => self.provider_cursor.step(delta, self.provider_count()),
+            (Pane::Providers, Lens::Providers) => {
+                self.provider_cursor.step(delta, self.provider_count())
+            }
+            (Pane::Providers, Lens::Mcp) => self.mcp_cursor.step(delta, self.mcp_count()),
         }
+    }
+
+    /// Keep the right pane's cursor on a real row after its list changed shape.
+    fn clamp_right(&mut self) {
+        self.provider_cursor.clamp(self.provider_count());
+        self.mcp_cursor.clamp(self.mcp_count());
     }
 
     fn schedule(&mut self, job: Job, note: &str) {
@@ -1369,7 +1763,156 @@ impl App {
             Job::Check => self.check_selected(),
             Job::CheckAll => self.check_all(terminal),
             Job::Models => self.open_models(),
+            Job::McpCheck => self.mcp_check_selected(),
+            Job::McpCheckAll => self.mcp_check_all(terminal),
             Job::Sync { prune } => self.sync_selected(prune),
+        }
+    }
+
+    /// Check one MCP server and remember the verdict for the health column.
+    fn probe_mcp(&mut self, agent_id: &str, server: &mcp::Server) -> mcp::Health {
+        let health = mcp::check(server, net::DEFAULT_TIMEOUT);
+        let tone = match &health {
+            mcp::Health::Ok(_) => Tone::Good,
+            mcp::Health::Broken(_) => Tone::Bad,
+            mcp::Health::Skipped(_) => Tone::Info,
+        };
+        self.say(tone, format!("{}: {}", server.name, health.message()));
+        self.mcp_health.record(agent_id, &server.name, health.clone());
+        health
+    }
+
+    fn mcp_check_selected(&mut self) {
+        let (Some(agent_id), Some(server)) =
+            (self.agent().map(|a| a.id.clone()), self.mcp_server().cloned())
+        else {
+            return;
+        };
+        self.probe_mcp(&agent_id, &server);
+    }
+
+    fn mcp_check_all(&mut self, terminal: &mut DefaultTerminal) {
+        let (Some(agent_id), Some(servers)) =
+            (self.agent().map(|a| a.id.clone()), self.agent().map(|a| a.mcp.clone()))
+        else {
+            return;
+        };
+
+        let total = servers.len();
+        let (mut ok, mut broken, mut skipped) = (0usize, 0usize, 0usize);
+        for (index, server) in servers.iter().enumerate() {
+            self.say(Tone::Info, format!("checking {} ({}/{total})…", server.name, index + 1));
+            // A remote check blocks, so the frame announcing it has to land first.
+            self.draw(terminal);
+
+            match self.probe_mcp(&agent_id, server) {
+                mcp::Health::Ok(_) => ok += 1,
+                mcp::Health::Broken(_) => broken += 1,
+                mcp::Health::Skipped(_) => skipped += 1,
+            }
+        }
+
+        let mut summary = format!("{ok} ok · {broken} broken");
+        if skipped > 0 {
+            summary.push_str(&format!(" · {skipped} disabled"));
+        }
+        let tone = if broken == 0 { Tone::Good } else { Tone::Info };
+        self.say(tone, summary);
+    }
+
+    fn open_mcp_form(&mut self, existing: Option<mcp::Server>) {
+        let Some(agent_id) = self.agent().map(|a| a.id.clone()) else { return };
+        self.overlay = Some(Overlay::Form(Form::mcp(agent_id, existing.as_ref())));
+    }
+
+    fn open_mcp_detail(&mut self) {
+        if self.focus == Pane::Agents {
+            self.focus = Pane::Providers;
+            return;
+        }
+        self.overlay = Some(Overlay::McpDetail { scroll: 0 });
+    }
+
+    fn ask_delete_mcp(&mut self) {
+        let (Some(agent), Some(server)) = (self.agent(), self.mcp_server()) else { return };
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            prompt: format!("Delete MCP server {} from {}?", server.name, agent.name),
+            agent_id: agent.id.clone(),
+            subject_id: server.name.clone(),
+            subject: Subject::Mcp,
+        }));
+    }
+
+    fn toggle_mcp(&mut self) {
+        let Some(server) = self.mcp_server().cloned() else { return };
+        let wanted = !server.is_enabled();
+        let name = server.name.clone();
+        // `set_mcp_enabled` fails on agents with no such flag; `apply` reports
+        // that message rather than pretending the server was turned off.
+        self.apply("toggle", move |config| {
+            config.set_mcp_enabled(&name, wanted)?;
+            Ok(format!("{name} {}", if wanted { "enabled" } else { "disabled" }))
+        });
+    }
+
+    fn open_mcp_presets(&mut self) {
+        match preset::mcp_all() {
+            Ok(presets) if presets.is_empty() => self.say(Tone::Info, "no MCP presets available"),
+            Ok(presets) => {
+                self.overlay = Some(Overlay::McpPresets(McpPresetPicker {
+                    presets,
+                    cursor: Cursor::default(),
+                }))
+            }
+            Err(err) => self.say(Tone::Bad, format!("MCP presets unreadable: {err:#}")),
+        }
+    }
+
+    fn apply_mcp_preset_by_id(&mut self, id: &str) {
+        match preset::mcp_find(id) {
+            Ok(entry) => self.apply_mcp_preset(&entry),
+            Err(err) => self.say(Tone::Bad, format!("{err:#}")),
+        }
+    }
+
+    fn apply_mcp_preset(&mut self, entry: &preset::McpPreset) {
+        let server = match entry.server(None) {
+            Ok(server) => server,
+            Err(err) => {
+                self.say(Tone::Bad, format!("MCP preset {}: {err:#}", entry.id));
+                return;
+            }
+        };
+
+        let missing: Vec<String> = entry.missing_env().iter().map(|v| v.to_string()).collect();
+        let name = server.name.clone();
+        let reported = name.clone();
+        let agent_id = self.agent().map(|a| a.id.clone()).unwrap_or_default();
+
+        self.apply("mcp preset", move |config| {
+            config.upsert_mcp(&server)?;
+            Ok(format!("added {reported}"))
+        });
+
+        self.mcp_health.forget(&agent_id, &name);
+        // The server will start without these, it just will not work; the CLI
+        // warns the same way rather than refusing.
+        if !missing.is_empty() && self.status.tone == Tone::Good {
+            self.say(Tone::Info, format!("added {name}, but ${} is not set", missing.join(", $")));
+        }
+        self.select_server(&name);
+    }
+
+    /// Put the cursor on a named MCP server, dropping a filter that hides it.
+    fn select_server(&mut self, name: &str) {
+        let visible = self.visible_servers().iter().any(|s| s.name == name);
+        if !visible {
+            self.filter.clear();
+        }
+        if let Some(index) = self.visible_servers().iter().position(|s| s.name == name) {
+            self.mcp_cursor = Cursor { index };
+            self.lens = Lens::Mcp;
+            self.focus = Pane::Providers;
         }
     }
 
@@ -1539,7 +2082,8 @@ impl App {
         self.overlay = Some(Overlay::Confirm(Confirm {
             prompt: format!("Delete {} from {}?", provider.id, agent.name),
             agent_id: agent.id.clone(),
-            provider_id: provider.id.clone(),
+            subject_id: provider.id.clone(),
+            subject: Subject::Provider,
         }));
     }
 
@@ -1567,6 +2111,10 @@ impl App {
             Overlay::Presets(picker) => self.preset_key(key, picker),
             Overlay::Palette(palette) => self.palette_key(key, raw, palette),
             Overlay::Models(picker) => self.models_key(key, raw, picker),
+            Overlay::McpDetail { scroll } => {
+                scroll_key(key, scroll).map(|scroll| Overlay::McpDetail { scroll })
+            }
+            Overlay::McpPresets(picker) => self.mcp_preset_key(key, picker),
         };
         // A handler that opened its own overlay — a form, the preset picker —
         // wins over the one it replaced.
@@ -1684,6 +2232,13 @@ impl App {
 
     /// Returns the overlay to keep showing: the form stays open when it is invalid.
     fn save_form(&mut self, form: &Form) -> Option<Overlay> {
+        match form.subject {
+            Subject::Provider => self.save_provider_form(form),
+            Subject::Mcp => self.save_mcp_form(form),
+        }
+    }
+
+    fn save_provider_form(&mut self, form: &Form) -> Option<Overlay> {
         let provider = match form.provider() {
             Ok(provider) => provider,
             Err(err) => {
@@ -1712,6 +2267,33 @@ impl App {
         None
     }
 
+    fn save_mcp_form(&mut self, form: &Form) -> Option<Overlay> {
+        let server = match form.server() {
+            Ok(server) => server,
+            Err(err) => {
+                self.say(Tone::Bad, format!("{err:#}"));
+                return Some(Overlay::Form(form.clone()));
+            }
+        };
+
+        self.select_agent(&form.agent_id);
+
+        let name = server.name.clone();
+        let reported = name.clone();
+        self.apply("save", move |config| {
+            config.upsert_mcp(&server)?;
+            Ok(format!("saved {reported}"))
+        });
+
+        if self.status.tone == Tone::Bad {
+            return Some(Overlay::Form(form.clone()));
+        }
+        // The command may now be a different one entirely.
+        self.mcp_health.forget(&form.agent_id, &name);
+        self.select_server(&name);
+        None
+    }
+
     fn select_agent(&mut self, id: &str) {
         if let Some(index) = self.agents.iter().position(|entry| entry.id == id) {
             self.agent_cursor = Cursor { index };
@@ -1735,18 +2317,31 @@ impl App {
     fn confirm_key(&mut self, key: KeyEvent, confirm: Confirm) -> Option<Overlay> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let Confirm { agent_id, provider_id, .. } = confirm;
+                let Confirm { agent_id, subject_id: id, subject, .. } = confirm;
                 self.select_agent(&agent_id);
-                self.health.forget(&agent_id, &provider_id);
-                let id = provider_id;
-                self.apply("delete", move |config| {
-                    if config.remove_provider(&id)? {
-                        Ok(format!("removed {id}"))
-                    } else {
-                        anyhow::bail!("no provider called {id:?}")
+                match subject {
+                    Subject::Provider => {
+                        self.health.forget(&agent_id, &id);
+                        self.apply("delete", move |config| {
+                            if config.remove_provider(&id)? {
+                                Ok(format!("removed {id}"))
+                            } else {
+                                anyhow::bail!("no provider called {id:?}")
+                            }
+                        });
                     }
-                });
-                self.provider_cursor.clamp(self.provider_count());
+                    Subject::Mcp => {
+                        self.mcp_health.forget(&agent_id, &id);
+                        self.apply("delete", move |config| {
+                            if config.remove_mcp(&id)? {
+                                Ok(format!("removed {id}"))
+                            } else {
+                                anyhow::bail!("no MCP server called {id:?}")
+                            }
+                        });
+                    }
+                }
+                self.clamp_right();
                 None
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -1776,6 +2371,28 @@ impl App {
                 None
             }
             _ => Some(Overlay::Presets(picker)),
+        }
+    }
+
+    fn mcp_preset_key(&mut self, key: KeyEvent, mut picker: McpPresetPicker) -> Option<Overlay> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.cursor.step(-1, picker.presets.len());
+                Some(Overlay::McpPresets(picker))
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.cursor.step(1, picker.presets.len());
+                Some(Overlay::McpPresets(picker))
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = picker.presets.get(picker.cursor.index()) {
+                    let entry = entry.clone();
+                    self.apply_mcp_preset(&entry);
+                }
+                None
+            }
+            _ => Some(Overlay::McpPresets(picker)),
         }
     }
 
@@ -1852,7 +2469,7 @@ impl App {
             agents: left,
             providers: right,
             agent_rows: self.agent_pane(left).render(frame, left),
-            provider_rows: self.provider_pane(right).render(frame, right),
+            provider_rows: self.right_pane(right).render(frame, right),
             ..Hits::default()
         };
 
@@ -1882,6 +2499,14 @@ impl App {
             }
             Some(Overlay::Models(picker)) => {
                 let (area, rows) = render_models(frame, picker);
+                hits.overlay = Some(area);
+                hits.overlay_rows = rows;
+            }
+            Some(Overlay::McpDetail { scroll }) => {
+                hits.overlay = Some(self.render_mcp_detail(frame, *scroll))
+            }
+            Some(Overlay::McpPresets(picker)) => {
+                let (area, rows) = render_mcp_presets(frame, picker);
                 hits.overlay = Some(area);
                 hits.overlay_rows = rows;
             }
@@ -1990,7 +2615,9 @@ impl App {
 
     fn hints(&self) -> Vec<Hint> {
         match &self.overlay {
-            Some(Overlay::About { .. }) | Some(Overlay::Detail(_)) => {
+            Some(Overlay::About { .. })
+            | Some(Overlay::Detail(_))
+            | Some(Overlay::McpDetail { .. }) => {
                 vec![Hint::plain("↑↓", "scroll"), Hint::plain("esc", "close")]
             }
             Some(Overlay::Form(form)) if form.editing => vec![
@@ -2008,7 +2635,7 @@ impl App {
             Some(Overlay::Confirm(_)) => {
                 vec![Hint::plain("y", "delete"), Hint::plain("n", "cancel")]
             }
-            Some(Overlay::Presets(_)) => vec![
+            Some(Overlay::Presets(_)) | Some(Overlay::McpPresets(_)) => vec![
                 Hint::plain("↑↓", "move"),
                 Hint::plain("enter", "apply"),
                 Hint::plain("esc", "cancel"),
@@ -2032,11 +2659,16 @@ impl App {
             ],
             None => {
                 let mut hints = vec![Hint::plain("↑↓", "move")];
-                hints.extend(match self.focus {
-                    Pane::Agents => {
-                        Hint::bar([Action::Palette, Action::Reload, Action::Help, Action::Quit])
-                    }
-                    Pane::Providers => Hint::bar([
+                hints.extend(match (self.focus, self.lens()) {
+                    (Pane::Agents, _) => Hint::bar([
+                        Action::Lens(None),
+                        Action::Palette,
+                        Action::Reload,
+                        Action::Help,
+                        Action::Quit,
+                    ]),
+                    (Pane::Providers, Lens::Providers) => Hint::bar([
+                        Action::Lens(None),
                         Action::Detail,
                         Action::Filter,
                         Action::Use(None),
@@ -2047,6 +2679,19 @@ impl App {
                         Action::Check,
                         Action::Sync { prune: false },
                         Action::Preset(None),
+                        Action::Palette,
+                        Action::Help,
+                    ]),
+                    (Pane::Providers, Lens::Mcp) => Hint::bar([
+                        Action::Lens(None),
+                        Action::McpDetail,
+                        Action::Filter,
+                        Action::McpToggle,
+                        Action::McpAdd,
+                        Action::McpEdit,
+                        Action::McpDelete,
+                        Action::McpCheck,
+                        Action::McpPreset(None),
                         Action::Palette,
                         Action::Help,
                     ]),
@@ -2097,6 +2742,29 @@ impl App {
         }
     }
 
+    /// The right-hand pane, under whichever lens is in force.
+    fn right_pane(&self, area: Rect) -> ListPane {
+        match self.lens() {
+            Lens::Providers => self.provider_pane(area),
+            Lens::Mcp => self.mcp_pane(area),
+        }
+    }
+
+    /// ` Codex · providers 11 `, carrying the filter clause when one is live.
+    fn pane_title(&self, agent: &AgentEntry, lens: Lens, shown: usize, total: usize) -> String {
+        if self.filter.active() || self.filter.editing {
+            format!(
+                "{} · {} {shown}/{total} · /{}{}",
+                agent.name,
+                lens.label(),
+                self.filter.query,
+                if self.filter.editing { CURSOR_BAR } else { "" }
+            )
+        } else {
+            format!("{} · {} {total}", agent.name, lens.label())
+        }
+    }
+
     fn provider_pane(&self, area: Rect) -> ListPane {
         let focused = self.focus == Pane::Providers;
         let Some(agent) = self.agent() else {
@@ -2112,18 +2780,7 @@ impl App {
 
         let total = agent.providers.len();
         let visible = self.visible_providers();
-        let title = if self.filter.active() || self.filter.editing {
-            format!(
-                "{} · providers {}/{} · /{}{}",
-                agent.name,
-                visible.len(),
-                total,
-                self.filter.query,
-                if self.filter.editing { CURSOR_BAR } else { "" }
-            )
-        } else {
-            format!("{} · providers {}", agent.name, total)
-        };
+        let title = self.pane_title(agent, Lens::Providers, visible.len(), total);
 
         if total == 0 {
             return ListPane::notice(
@@ -2210,6 +2867,146 @@ impl App {
             selected: self.provider_cursor.index(),
             empty: Vec::new(),
         }
+    }
+
+    fn mcp_pane(&self, area: Rect) -> ListPane {
+        let focused = self.focus == Pane::Providers;
+        let Some(agent) = self.agent() else {
+            return ListPane::notice("mcp", focused, vec!["no agent selected".to_string()]);
+        };
+        if let Some(err) = &agent.error {
+            return ListPane::notice(&format!("{} · mcp", agent.name), focused, vec![err.clone()]);
+        }
+
+        let total = agent.mcp.len();
+        let visible = self.visible_servers();
+        let title = self.pane_title(agent, Lens::Mcp, visible.len(), total);
+
+        if total == 0 {
+            return ListPane::notice(
+                &title,
+                focused,
+                vec![
+                    format!("{} launches no MCP servers yet", agent.name),
+                    String::new(),
+                    "press 'a' to add one, or 'p' for a ready-made one".to_string(),
+                ],
+            );
+        }
+        if visible.is_empty() {
+            return ListPane::notice(
+                &title,
+                focused,
+                vec![
+                    format!("nothing matches \"{}\"", self.filter.query.trim()),
+                    String::new(),
+                    "press esc to clear the filter".to_string(),
+                ],
+            );
+        }
+
+        let inner = area.width.saturating_sub(2) as usize;
+        let columns = Columns::flexible(inner.saturating_sub(1), &[1, 18, 7, 10], 3, 12);
+
+        let rows = visible
+            .iter()
+            .map(|server| {
+                let enabled = server.is_enabled();
+                let mut row = Row::default();
+                row.cell(
+                    &columns,
+                    if enabled { brand::MARK } else { " " },
+                    Style::default().fg(palette::ACCENT),
+                );
+                row.cell(&columns, &server.name, Style::default().fg(palette::TEXT));
+                row.cell(&columns, server.transport.kind(), Style::default().fg(palette::MUTED));
+                row.cell(
+                    &columns,
+                    &server.transport.summary(),
+                    Style::default().fg(palette::MUTED),
+                );
+
+                let (text, style) = match self.mcp_health.get(&agent.id, &server.name) {
+                    Some(mcp::Health::Ok(_)) => {
+                        (format!("{DOT_FILLED} ok"), Style::default().fg(palette::GOOD))
+                    }
+                    Some(mcp::Health::Broken(_)) => {
+                        (format!("{DOT_FILLED} broken"), Style::default().fg(palette::BAD))
+                    }
+                    Some(mcp::Health::Skipped(_)) => {
+                        (format!("{DOT_HOLLOW} off"), Style::default().fg(palette::FAINT))
+                    }
+                    None => (DOT_HOLLOW.to_string(), Style::default().fg(palette::FAINT)),
+                };
+                row.cell(&columns, &text, style);
+                // A disabled server is still configured, just not running.
+                row.dim = !enabled;
+                row
+            })
+            .collect();
+
+        ListPane {
+            title,
+            focused,
+            header: Some(columns.header(&["", "server", "kind", "command or url", "health"])),
+            rows,
+            selected: self.mcp_cursor.index(),
+            empty: Vec::new(),
+        }
+    }
+
+    fn render_mcp_detail(&self, frame: &mut Frame, scroll: u16) -> Rect {
+        let area = centered(frame.area(), 76, 78);
+        let (Some(agent), Some(server)) = (self.agent(), self.mcp_server()) else { return area };
+
+        let mut lines = vec![
+            labelled("agent", &agent.name),
+            labelled("config", &agent.config_path.display().to_string()),
+            labelled("name", &server.name),
+            labelled("transport", server.transport.kind()),
+            labelled("enabled", if server.is_enabled() { "yes" } else { "no" }),
+        ];
+
+        match &server.transport {
+            mcp::Transport::Stdio { command, args } => {
+                lines.push(labelled("command", command));
+                // One argument per line: a long npx invocation is unreadable
+                // as a single wrapped string.
+                for (index, arg) in args.iter().enumerate() {
+                    lines.push(labelled(&format!("arg {}", index + 1), arg));
+                }
+            }
+            mcp::Transport::Remote { url } => lines.push(labelled("url", url)),
+        }
+
+        lines.push(labelled(
+            "health",
+            match self.mcp_health.get(&agent.id, &server.name) {
+                Some(health) => health.message(),
+                None => "not checked this session",
+            },
+        ));
+
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            format!("environment ({})", server.env.len()),
+            Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        if server.env.is_empty() {
+            lines.push(Line::from(Span::styled("  none set", Style::default().fg(palette::FAINT))));
+        }
+        for (key, value) in &server.env {
+            // These are API tokens as often as not, so the value is never shown
+            // in full even though it sits in a config file in plain text.
+            lines.push(labelled(key, &mask(value)));
+        }
+
+        let inner = overlay_frame(frame, area, &format!("mcp · {}", server.name));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+            inner,
+        );
+        area
     }
 
     fn render_detail(&self, frame: &mut Frame, detail: &Detail) -> Rect {
@@ -2490,23 +3287,46 @@ fn render_about(frame: &mut Frame, scroll: u16) -> Rect {
     }
     lines.push(Line::default());
 
-    let rows: Vec<(String, String)> = NAVIGATION
-        .iter()
-        .map(|(key, what)| ((*key).to_string(), (*what).to_string()))
-        .chain(menu().iter().filter_map(|action| {
-            action.binding().map(|key| (key.to_string(), action.description()))
-        }))
-        .collect();
+    let bindings = |actions: Vec<Action>| -> Vec<(String, String)> {
+        actions
+            .iter()
+            .filter_map(|action| {
+                action.binding().map(|key| (key.to_string(), action.description()))
+            })
+            .collect()
+    };
+    let navigation: Vec<(String, String)> =
+        NAVIGATION.iter().map(|(key, what)| ((*key).to_string(), (*what).to_string())).collect();
 
-    let key_width = rows.iter().map(|(key, _)| key.chars().count()).max().unwrap_or(0);
-    for (key, what) in rows {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}", fit(&key, key_width)),
-                Style::default().fg(palette::ACCENT),
-            ),
-            Span::styled(format!("   {what}"), Style::default().fg(palette::MUTED)),
-        ]));
+    // One column width across both sections, so the two tables line up.
+    let sections = [
+        (None, [navigation, bindings(menu())].concat()),
+        (Some("with the right pane showing mcp servers (v)"), bindings(mcp_menu())),
+    ];
+    let key_width = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    for (heading, rows) in sections {
+        if let Some(heading) = heading {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!("  {heading}"),
+                Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD),
+            )));
+        }
+        for (key, what) in rows {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}", fit(&key, key_width)),
+                    Style::default().fg(palette::ACCENT),
+                ),
+                Span::styled(format!("   {what}"), Style::default().fg(palette::MUTED)),
+            ]));
+        }
     }
 
     let area = centered(frame.area(), 74, 90);
@@ -2534,14 +3354,9 @@ fn render_form(frame: &mut Frame, form: &Form) -> Rect {
                     Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD),
                 ));
             } else {
-                // A key is only ever legible while it is the field being typed into.
-                let shown = if value.is_empty() {
-                    ABSENT.to_string()
-                } else if *kind == FieldKind::ApiKey {
-                    mask(value)
-                } else {
-                    value.clone()
-                };
+                // A secret is only ever legible while it is the field being
+                // typed into; env values are tokens as often as keys are.
+                let shown = if value.is_empty() { ABSENT.to_string() } else { kind.redact(value) };
                 let style = if value.is_empty() {
                     Style::default().fg(palette::FAINT)
                 } else {
@@ -2615,6 +3430,39 @@ fn render_presets(frame: &mut Frame, picker: &PresetPicker) -> (Rect, RowsAt) {
         rows,
         selected: picker.cursor.index(),
         empty: vec!["no presets available".to_string()],
+    }
+    .render_overlay(frame, area);
+    (area, rows_at)
+}
+
+fn render_mcp_presets(frame: &mut Frame, picker: &McpPresetPicker) -> (Rect, RowsAt) {
+    let area = centered(frame.area(), 78, 74);
+    let inner = area.width.saturating_sub(2) as usize;
+    let columns = Columns::flexible(inner.saturating_sub(1), &[16, 26], 2, 20);
+
+    let rows = picker
+        .presets
+        .iter()
+        .map(|entry| {
+            let command = entry
+                .server(None)
+                .map(|server| server.transport.summary())
+                .unwrap_or_else(|_| ABSENT.to_string());
+            let mut row = Row::default();
+            row.cell(&columns, &entry.id, Style::default().fg(palette::TEXT));
+            row.cell(&columns, &command, Style::default().fg(palette::MUTED));
+            row.cell(&columns, &entry.description, Style::default().fg(palette::FAINT));
+            row
+        })
+        .collect();
+
+    let rows_at = ListPane {
+        title: format!("mcp presets {}", picker.presets.len()),
+        focused: true,
+        header: Some(columns.header(&["preset", "command or url", "what it does"])),
+        rows,
+        selected: picker.cursor.index(),
+        empty: vec!["no MCP presets available".to_string()],
     }
     .render_overlay(frame, area);
     (area, rows_at)
@@ -2912,6 +3760,19 @@ mod render_tests {
             providers: Vec::new(),
             active: Some("primary".into()),
             model: Some("gpt-5.5".into()),
+            mcp: vec![
+                mcp::Server::stdio("continuum", "npx", &["-y", "continuum-mcp"]),
+                {
+                    let mut off = mcp::Server::stdio("git", "uvx", &["mcp-server-git"]);
+                    off.enabled = Some(false);
+                    off
+                },
+                {
+                    let mut remote = mcp::Server::remote("ctx7", "https://mcp.example.invalid/sse");
+                    remote.env.insert("CONTEXT7_API_KEY".into(), "ctx7-secret-token".into());
+                    remote
+                },
+            ],
             error: None,
         };
         for (id, url, key) in [
@@ -2941,6 +3802,7 @@ mod render_tests {
             providers: Vec::new(),
             active: None,
             model: Some("codexsale/gpt-5.5".into()),
+            mcp: Vec::new(),
             error: None,
         };
 
@@ -2948,9 +3810,12 @@ mod render_tests {
             agents: vec![codex, opencode],
             agent_cursor: Cursor::default(),
             provider_cursor: Cursor::default(),
+            mcp_cursor: Cursor::default(),
             focus: Pane::Providers,
+            lens: Lens::default(),
             filter: Filter::default(),
             health: HealthCache::default(),
+            mcp_health: HealthCache::default(),
             overlay: None,
             status: Status::default(),
             pending: None,
@@ -3015,14 +3880,88 @@ mod render_tests {
             Overlay::Confirm(Confirm {
                 prompt: "delete primary?".into(),
                 agent_id: "codex".into(),
-                provider_id: "primary".into(),
+                subject_id: "primary".into(),
+                subject: Subject::Provider,
             }),
+            Overlay::McpDetail { scroll: 0 },
+            Overlay::McpPresets(McpPresetPicker {
+                presets: preset::mcp_all().expect("shipped mcp presets"),
+                cursor: Cursor::default(),
+            }),
+            Overlay::Form(Form::mcp("codex", None)),
         ] {
             let mut app = scene();
             app.overlay = Some(overlay);
             let text = screen(&mut app, 120, 30);
             assert!(!text.trim().is_empty(), "overlay drew nothing");
         }
+    }
+
+    #[test]
+    fn the_mcp_lens_swaps_the_right_pane_and_names_itself() {
+        let mut app = scene();
+        let providers = screen(&mut app, 120, 30);
+        assert!(providers.contains("providers 3"), "provider pane missing:\n{providers}");
+        assert!(!providers.contains("continuum"), "mcp leaked into the provider pane");
+
+        app.lens = Lens::Mcp;
+        let servers = screen(&mut app, 120, 30);
+        assert!(servers.contains("mcp 3"), "no mcp count in the title:\n{servers}");
+        assert!(servers.contains("continuum") && servers.contains("ctx7"), "{servers}");
+        assert!(servers.contains("stdio") && servers.contains("remote"), "no kinds:\n{servers}");
+        // The command line, not just the program name.
+        assert!(servers.contains("continuum-mcp"), "no command summary:\n{servers}");
+        assert!(!servers.contains("primary"), "providers leaked into the mcp pane");
+    }
+
+    #[test]
+    fn an_agent_without_mcp_never_shows_the_mcp_pane() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        app.agents[0].capabilities.mcp = false;
+
+        assert_eq!(app.lens(), Lens::Providers, "the lens must fall back");
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("providers 3"), "expected the provider pane:\n{text}");
+    }
+
+    #[test]
+    fn the_mcp_detail_masks_environment_values() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        // The remote server is the one carrying a token.
+        app.mcp_cursor = Cursor { index: 2 };
+        app.overlay = Some(Overlay::McpDetail { scroll: 0 });
+        let text = screen(&mut app, 120, 30);
+
+        assert!(text.contains("CONTEXT7_API_KEY"), "env key missing:\n{text}");
+        assert!(!text.contains("ctx7-secret-token"), "env value rendered in full:\n{text}");
+    }
+
+    #[test]
+    fn a_disabled_mcp_server_is_marked_off_rather_than_hidden() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        let text = screen(&mut app, 120, 30);
+
+        let row =
+            text.lines().find(|line| line.contains("git ")).expect("no row for the git server");
+        // Still listed, just not carrying the enabled mark.
+        assert!(!row.contains(brand::MARK), "a disabled server must not look enabled: {row:?}");
+    }
+
+    #[test]
+    fn the_hint_bar_follows_the_lens() {
+        let mut app = scene();
+        let providers = screen(&mut app, 160, 30);
+        assert!(providers.lines().last().unwrap().contains("sync"), "{providers}");
+
+        app.lens = Lens::Mcp;
+        let servers = screen(&mut app, 160, 30);
+        let hints = servers.lines().last().unwrap();
+        assert!(hints.contains("v providers/mcp"), "no lens hint: {hints:?}");
+        assert!(hints.contains("u on/off"), "no toggle hint: {hints:?}");
+        assert!(!hints.contains("sync"), "provider-only hint survived: {hints:?}");
     }
 
     #[test]
@@ -3292,6 +4231,182 @@ mod tests {
         assert_eq!(format_limits(None, None), None);
     }
 
+    fn servers() -> Vec<mcp::Server> {
+        let mut remote = mcp::Server::remote("ctx7", "https://mcp.example.invalid/sse");
+        remote.env.insert("CONTEXT7_API_KEY".into(), "secret".into());
+        vec![mcp::Server::stdio("continuum", "npx", &["-y", "continuum-mcp"]), remote]
+    }
+
+    fn matching_servers(query: &str) -> Vec<String> {
+        let filter = Filter { query: query.to_string(), editing: false };
+        servers().iter().filter(|s| filter.matches_server(s)).map(|s| s.name.clone()).collect()
+    }
+
+    #[test]
+    fn a_filter_finds_a_server_by_name_kind_or_command() {
+        assert_eq!(matching_servers("continuum"), vec!["continuum"]);
+        assert_eq!(matching_servers("remote"), vec!["ctx7"]);
+        assert_eq!(matching_servers("stdio"), vec!["continuum"]);
+        // The command line, not only the program.
+        assert_eq!(matching_servers("continuum-mcp"), vec!["continuum"]);
+        assert_eq!(matching_servers("example.invalid"), vec!["ctx7"]);
+    }
+
+    #[test]
+    fn a_server_filter_ignores_case_and_can_match_nothing() {
+        assert_eq!(matching_servers("CONTINUUM"), vec!["continuum"]);
+        assert_eq!(matching_servers("").len(), 2);
+        assert!(matching_servers("no-such-server").is_empty());
+    }
+
+    #[test]
+    fn the_lens_names_itself_and_toggles() {
+        assert_eq!(Lens::Providers.other(), Lens::Mcp);
+        assert_eq!(Lens::Mcp.other().other(), Lens::Mcp);
+        assert_eq!(Lens::default(), Lens::Providers);
+        assert_eq!(Lens::Mcp.label(), "mcp");
+    }
+
+    #[test]
+    fn a_health_cache_keeps_providers_and_servers_apart() {
+        // The two caches are the same type over different verdicts, so a server
+        // called the same thing as a provider cannot overwrite it.
+        let mut providers: HealthCache<Health> = HealthCache::default();
+        let mut servers: HealthCache<mcp::Health> = HealthCache::default();
+
+        providers.record("codex", "git", Health { alive: true, millis: 12 });
+        servers.record("codex", "git", mcp::Health::Broken("uvx is not on PATH".into()));
+
+        assert!(providers.get("codex", "git").unwrap().alive);
+        assert!(!servers.get("codex", "git").unwrap().is_ok());
+        assert_eq!(servers.get("codex", "git").unwrap().message(), "uvx is not on PATH");
+
+        servers.forget("codex", "git");
+        assert!(servers.get("codex", "git").is_none());
+        assert!(providers.get("codex", "git").is_some(), "the other cache must be untouched");
+    }
+
+    #[test]
+    fn an_mcp_form_builds_a_stdio_server_with_its_arguments_split() {
+        let mut form = Form::mcp("codex", None);
+        form.fields = vec![
+            (FieldKind::Name, "continuum".into()),
+            (FieldKind::Command, "npx".into()),
+            (FieldKind::Args, "  -y   continuum-mcp ".into()),
+            (FieldKind::Url, String::new()),
+            (FieldKind::Env, "TOKEN=abc  MODE=fast".into()),
+        ];
+
+        let server = form.server().unwrap();
+        assert_eq!(server.name, "continuum");
+        assert_eq!(
+            server.transport,
+            mcp::Transport::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "continuum-mcp".into()],
+            }
+        );
+        assert_eq!(server.env.get("TOKEN").unwrap(), "abc");
+        assert_eq!(server.env.get("MODE").unwrap(), "fast");
+        // The toggle owns `enabled`; a save must not silently re-enable.
+        assert_eq!(server.enabled, None);
+    }
+
+    #[test]
+    fn an_mcp_form_builds_a_remote_server_from_a_url() {
+        let mut form = Form::mcp("codex", None);
+        form.fields = vec![
+            (FieldKind::Name, "ctx7".into()),
+            (FieldKind::Command, String::new()),
+            (FieldKind::Args, String::new()),
+            (FieldKind::Url, " https://mcp.example.invalid/sse ".into()),
+            (FieldKind::Env, String::new()),
+        ];
+
+        let server = form.server().unwrap();
+        assert_eq!(server.transport.url(), Some("https://mcp.example.invalid/sse"));
+        assert!(server.env.is_empty());
+    }
+
+    #[test]
+    fn an_mcp_form_refuses_a_command_and_a_url_together() {
+        let mut form = Form::mcp("codex", None);
+        form.fields = vec![
+            (FieldKind::Name, "both".into()),
+            (FieldKind::Command, "npx".into()),
+            (FieldKind::Args, String::new()),
+            (FieldKind::Url, "https://example.invalid".into()),
+            (FieldKind::Env, String::new()),
+        ];
+
+        let err = form.server().unwrap_err().to_string();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn an_mcp_form_says_what_is_missing() {
+        let bare = Form::mcp("codex", None);
+        assert!(bare.server().unwrap_err().to_string().contains("needs a name"));
+
+        let mut named = Form::mcp("codex", None);
+        named.fields[0].1 = "x".into();
+        assert!(named.server().unwrap_err().to_string().contains("either a command or a url"));
+
+        let mut bad_env = Form::mcp("codex", None);
+        bad_env.fields = vec![
+            (FieldKind::Name, "x".into()),
+            (FieldKind::Command, "npx".into()),
+            (FieldKind::Args, String::new()),
+            (FieldKind::Url, String::new()),
+            (FieldKind::Env, "NOEQUALS".into()),
+        ];
+        let err = bad_env.server().unwrap_err().to_string();
+        assert!(err.contains("KEY=VALUE"), "{err}");
+    }
+
+    #[test]
+    fn editing_a_server_round_trips_it_through_the_form() {
+        let mut source = mcp::Server::stdio("continuum", "npx", &["-y", "continuum-mcp"]);
+        source.env.insert("TOKEN".into(), "abc".into());
+        source.enabled = Some(false);
+
+        let form = Form::mcp("codex", Some(&source));
+        let rebuilt = form.server().unwrap();
+        assert_eq!(rebuilt.name, source.name);
+        assert_eq!(rebuilt.transport, source.transport);
+        assert_eq!(rebuilt.env, source.env);
+    }
+
+    #[test]
+    fn env_lines_are_shown_with_their_values_redacted() {
+        let shown = mask_env("TOKEN=sk-abcdefghijkl MODE=fast");
+        assert!(shown.starts_with("TOKEN="), "{shown}");
+        assert!(!shown.contains("sk-abcdefghijkl"), "the token survived: {shown}");
+        assert!(shown.contains("MODE="), "every pair must survive: {shown}");
+        // A malformed pair is passed through rather than dropped, so the user
+        // can see what they typed and fix it.
+        assert_eq!(mask_env("NOEQUALS"), "NOEQUALS");
+    }
+
+    #[test]
+    fn secret_fields_redact_and_ordinary_ones_do_not() {
+        assert_eq!(FieldKind::Command.redact("npx"), "npx");
+        assert_eq!(FieldKind::Url.redact("https://x/y"), "https://x/y");
+        assert!(!FieldKind::ApiKey.redact("sk-abcdefghijkl").contains("abcdefgh"));
+        assert!(!FieldKind::Env.redact("K=sk-abcdefghijkl").contains("abcdefgh"));
+    }
+
+    #[test]
+    fn the_palette_can_be_searched_for_mcp() {
+        let entries: Vec<Action> = menu().into_iter().chain(mcp_menu()).collect();
+        let hits: Vec<String> =
+            rank_by(&entries, "mcp", Action::label).iter().map(|i| entries[*i].label()).collect();
+
+        assert!(!hits.is_empty(), "typing mcp must find something");
+        assert!(hits.iter().any(|label| label == "add mcp server"), "{hits:?}");
+        assert!(hits.iter().any(|label| label.contains("mcp preset")), "{hits:?}");
+    }
+
     #[test]
     fn the_current_model_is_recognised_bare_or_qualified() {
         // Most agents name the model on its own.
@@ -3468,6 +4583,7 @@ mod tests {
             "S",
             "p",
             "r",
+            "v",
             "ctrl+p or ctrl+k",
             "?",
             "q",
@@ -3477,8 +4593,33 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_lens_reuses_the_bindings_it_shares_with_providers() {
+        let binding = |action: Action| action.binding().unwrap_or("").to_string();
+
+        // Same key, subject follows the lens. If these ever diverge the help
+        // screen would be telling the user two different things about one key.
+        for (providers, mcp) in [
+            (Action::Detail, Action::McpDetail),
+            (Action::Use(None), Action::McpToggle),
+            (Action::Add, Action::McpAdd),
+            (Action::Edit, Action::McpEdit),
+            (Action::Delete, Action::McpDelete),
+            (Action::Check, Action::McpCheck),
+            (Action::CheckAll, Action::McpCheckAll),
+            (Action::Preset(None), Action::McpPreset(None)),
+        ] {
+            assert_eq!(binding(providers.clone()), binding(mcp.clone()), "{providers:?}");
+        }
+
+        // Every MCP action is on the help screen's second table.
+        for action in mcp_menu() {
+            assert!(action.binding().is_some(), "{action:?} has no binding to document");
+        }
+    }
+
+    #[test]
     fn every_action_has_something_to_show_in_the_palette() {
-        for action in menu() {
+        for action in menu().into_iter().chain(mcp_menu()) {
             assert!(!action.label().is_empty());
             assert!(!action.description().is_empty());
             assert!(!action.hint().is_empty());
