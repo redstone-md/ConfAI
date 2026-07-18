@@ -143,6 +143,30 @@ In the interactive view, `s` syncs and `S` syncs with pruning.
 `confai provider check` is the same call without the writing: it reports whether
 each endpoint is up, how fast it answered, and how many models it serves.
 
+## Staying current
+
+`confai update` reports whether a newer release exists, summarises what changed
+and prints how to upgrade.
+
+Day to day you do not have to ask. After a command, ConfAI prints a two-line
+notice on stderr if a newer release is out:
+
+```
+◆ 0.0.1 → 0.0.2 available
+  · provider sync now prunes retired models
+  · run `confai update` for the rest
+```
+
+That notice is rendered from a cache checked at most once a day, so a normal run
+costs nothing — and when the cache is stale the check gets four hundred
+milliseconds to answer before the run gives up and tries again tomorrow. A failed
+check backs off for an hour rather than retrying on every invocation. Set
+`CONFAI_NO_UPDATE_CHECK` to turn it off entirely.
+
+ConfAI does not replace its own binary. `cargo` and the installers already do
+that properly, and a tool that rewrites itself while holding your credentials
+open is a worse trade than printing one line.
+
 ## Presets
 
 A preset is one endpoint described once, in agent-neutral terms, so the same

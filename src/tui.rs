@@ -959,6 +959,19 @@ impl App {
             quit: false,
         };
         app.reload();
+        if let Some(available) = crate::update::notice() {
+            let headline = available.headline(1).pop().unwrap_or_default();
+            let detail =
+                if headline.is_empty() { String::new() } else { format!(" — {headline}") };
+            app.say(
+                Tone::Good,
+                format!(
+                    "{} v{} available{detail} · run `confai update`",
+                    brand::MARK,
+                    available.latest
+                ),
+            );
+        }
         app
     }
 

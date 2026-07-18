@@ -19,3 +19,4 @@ pub mod preset;
 pub mod store;
 pub mod tui;
 pub mod ui;
+pub mod update;

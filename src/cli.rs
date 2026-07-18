@@ -79,6 +79,9 @@ pub enum Command {
     /// Show the version, the links and where ConfAI keeps its own state.
     About,
 
+    /// Check whether a newer release exists, and how to get it.
+    Update,
+
     /// Restore the config ConfAI backed up before its last write.
     Undo {
         #[command(flatten)]

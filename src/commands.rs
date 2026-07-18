@@ -23,6 +23,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Edit { target } => edit(&target),
         Command::Doctor => doctor(),
         Command::About => about(),
+        Command::Update => update(),
         Command::Undo { target } => undo(&target),
     }
 }
@@ -736,6 +737,74 @@ fn about() -> Result<()> {
     }
     print!("{}", agents.render());
     Ok(())
+}
+
+fn update() -> Result<()> {
+    match crate::update::check_now()? {
+        crate::update::Status::UpToDate { current } => {
+            println!("{} {} is the latest release", ui::green("✓"), ui::bold(&current.to_string()));
+        }
+        crate::update::Status::Unreleased { current, latest } => {
+            println!(
+                "{} this build is {}, ahead of the latest release {}",
+                ui::dim("·"),
+                ui::bold(&current.to_string()),
+                latest
+            );
+        }
+        crate::update::Status::Newer(available) => {
+            println!(
+                "{} {} → {}",
+                ui::accent(brand::MARK),
+                ui::dim(&available.current.to_string()),
+                ui::bold(&available.latest.to_string())
+            );
+            for line in available.headline(8) {
+                println!("  {} {line}", ui::dim("·"));
+            }
+            println!("\n{}", ui::dim(&available.url));
+            println!("\n{}", ui::bold("upgrade"));
+            for command in upgrade_commands() {
+                println!("  {command}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How this build is most likely to be replaced, best guess first.
+///
+/// ConfAI does not replace its own binary: the installers and `cargo` already
+/// do it properly, and a tool that rewrites itself while holding a user's
+/// credentials open is a worse trade than printing one line.
+fn upgrade_commands() -> Vec<String> {
+    let mut commands = vec!["cargo install confai --locked".to_string()];
+    if cfg!(windows) {
+        commands.push("irm https://redstone.md/confai/install.ps1 | iex".to_string());
+    } else {
+        commands.push("curl -fsSL https://redstone.md/confai/install.sh | sh".to_string());
+    }
+    commands.push(format!("or download from {}/releases/latest", brand::REPOSITORY));
+    commands
+}
+
+/// Print the update notice, if the cache knows of a newer release.
+///
+/// Goes to stderr so it never contaminates output being piped somewhere.
+pub fn print_update_notice() {
+    let Some(available) = crate::update::notice() else { return };
+
+    eprintln!(
+        "\n{} {} {} {} available",
+        ui::accent(brand::MARK),
+        ui::dim(&available.current.to_string()),
+        ui::dim("→"),
+        ui::bold(&available.latest.to_string())
+    );
+    for line in available.headline(3) {
+        eprintln!("  {} {line}", ui::dim("·"));
+    }
+    eprintln!("  {}", ui::dim("run `confai update` for the rest"));
 }
 
 fn undo(target: &Target) -> Result<()> {
