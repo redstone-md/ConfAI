@@ -1149,12 +1149,17 @@ fn update() -> Result<()> {
 /// do it properly, and a tool that rewrites itself while holding a user's
 /// credentials open is a worse trade than printing one line.
 fn upgrade_commands() -> Vec<String> {
-    let mut commands = vec!["cargo install confai --locked".to_string()];
+    // The installers are release assets, so `releases/latest/download/` always
+    // resolves to the newest one. There is no vanity domain serving them, and
+    // pointing at one that does not exist is worse than being verbose.
+    let installer = format!("{}/releases/latest/download", brand::REPOSITORY);
+    let mut commands = Vec::new();
     if cfg!(windows) {
-        commands.push("irm https://redstone.md/confai/install.ps1 | iex".to_string());
+        commands.push(format!("irm {installer}/install.ps1 | iex"));
     } else {
-        commands.push("curl -fsSL https://redstone.md/confai/install.sh | sh".to_string());
+        commands.push(format!("curl -fsSL {installer}/install.sh | sh"));
     }
+    commands.push("cargo install confai --locked".to_string());
     commands.push(format!("or download from {}/releases/latest", brand::REPOSITORY));
     commands
 }
