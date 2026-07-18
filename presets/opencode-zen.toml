@@ -1,0 +1,19 @@
+# opencode Zen fronts several upstreams and does not speak one protocol for all
+# of them. Per https://opencode.ai/docs/zen/ the same base URL serves:
+#
+#   /v1/chat/completions  DeepSeek, GLM, Kimi, MiniMax, Grok, the free models
+#   /v1/responses         the GPT family          -> preset `opencode-zen-gpt`
+#   /v1/messages          Claude and Qwen         -> preset `opencode-zen-claude`
+#
+# This preset covers the first. Add whichever others you use as their own
+# endpoint; an agent's provider carries one wire protocol, not three.
+
+id = "opencode-zen"
+name = "OpenCode Zen"
+description = "opencode's gateway, chat-completions models"
+homepage = "https://opencode.ai/docs/zen/"
+api_key_env = "OPENCODE_API_KEY"
+
+[provider]
+base_url = "https://opencode.ai/zen/v1"
+wire_api = "chat"

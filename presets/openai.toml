@@ -1,0 +1,13 @@
+# Verified by requesting https://api.openai.com/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "openai"
+name = "OpenAI"
+description = "OpenAI direct"
+homepage = "https://platform.openai.com/docs/api-reference"
+api_key_env = "OPENAI_API_KEY"
+
+[provider]
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"

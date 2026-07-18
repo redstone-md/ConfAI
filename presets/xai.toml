@@ -1,0 +1,13 @@
+# Verified by requesting https://api.x.ai/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "xai"
+name = "xAI"
+description = "Grok, direct from xAI"
+homepage = "https://docs.x.ai/"
+api_key_env = "XAI_API_KEY"
+
+[provider]
+base_url = "https://api.x.ai/v1"
+wire_api = "chat"

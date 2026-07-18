@@ -1,0 +1,45 @@
+# The models opencode Zen currently serves at no cost. Every one of these was
+# listed by https://opencode.ai/zen/v1/models at the time of writing, and the
+# docs describe them as free "for a limited time" — so treat this list as a
+# starting point and re-check with `confai provider models opencode-zen-free`.
+#
+# The docs also state that data collected during a model's free period may be
+# used to improve that model. That is the trade; it is not hidden, but it should
+# not be a surprise either.
+
+id = "opencode-zen-free"
+name = "OpenCode Zen (free)"
+description = "The models opencode Zen serves at no cost, for now"
+homepage = "https://opencode.ai/docs/zen/"
+api_key_env = "OPENCODE_API_KEY"
+default_model = "deepseek-v4-flash-free"
+
+[provider]
+id = "opencode-zen-free"
+display_name = "OpenCode Zen (free)"
+base_url = "https://opencode.ai/zen/v1"
+wire_api = "chat"
+
+[[models]]
+id = "deepseek-v4-flash-free"
+name = "DeepSeek V4 Flash Free"
+
+[[models]]
+id = "mimo-v2.5-free"
+name = "MiMo-V2.5 Free"
+
+[[models]]
+id = "north-mini-code-free"
+name = "North Mini Code Free"
+
+[[models]]
+id = "nemotron-3-ultra-free"
+name = "Nemotron 3 Ultra Free"
+
+[[models]]
+id = "hy3-free"
+name = "HY3 Free"
+
+[[models]]
+id = "big-pickle"
+name = "Big Pickle"

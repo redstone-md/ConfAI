@@ -1,0 +1,15 @@
+# The GPT family on opencode Zen, which is served over /v1/responses rather
+# than /v1/chat/completions. This is the variant Codex wants, since Codex speaks
+# the responses API.
+
+id = "opencode-zen-gpt"
+name = "OpenCode Zen (GPT)"
+description = "opencode's gateway, GPT models over the responses API"
+homepage = "https://opencode.ai/docs/zen/"
+api_key_env = "OPENCODE_API_KEY"
+
+[provider]
+id = "opencode-zen-gpt"
+display_name = "OpenCode Zen (GPT)"
+base_url = "https://opencode.ai/zen/v1"
+wire_api = "responses"

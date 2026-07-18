@@ -1,0 +1,13 @@
+# Verified by requesting https://api.z.ai/api/paas/v4/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "zai"
+name = "Z.ai (GLM)"
+description = "GLM models, international endpoint"
+homepage = "https://docs.z.ai/"
+api_key_env = "ZHIPU_API_KEY"
+
+[provider]
+base_url = "https://api.z.ai/api/paas/v4"
+wire_api = "chat"

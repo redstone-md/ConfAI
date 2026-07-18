@@ -1,0 +1,13 @@
+# Verified by requesting https://api.cerebras.ai/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "cerebras"
+name = "Cerebras"
+description = "Open-weight models on Cerebras wafer-scale hardware"
+homepage = "https://inference-docs.cerebras.ai/"
+api_key_env = "CEREBRAS_API_KEY"
+
+[provider]
+base_url = "https://api.cerebras.ai/v1"
+wire_api = "chat"

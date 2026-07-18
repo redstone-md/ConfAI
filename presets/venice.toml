@@ -1,0 +1,13 @@
+# Verified by requesting https://api.venice.ai/api/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "venice"
+name = "Venice AI"
+description = "Open-weight models, no request retention"
+homepage = "https://docs.venice.ai/"
+api_key_env = "VENICE_API_KEY"
+
+[provider]
+base_url = "https://api.venice.ai/api/v1"
+wire_api = "chat"

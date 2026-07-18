@@ -1,0 +1,13 @@
+# Verified by requesting https://ollama.com/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "ollama-cloud"
+name = "Ollama Cloud"
+description = "Ollama's hosted models"
+homepage = "https://docs.ollama.com/cloud"
+api_key_env = "OLLAMA_API_KEY"
+
+[provider]
+base_url = "https://ollama.com/v1"
+wire_api = "chat"

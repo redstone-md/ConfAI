@@ -1,0 +1,12 @@
+# Verified by requesting http://127.0.0.1:1234/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "lmstudio"
+name = "LM Studio (local)"
+description = "A local LM Studio server; no key needed"
+homepage = "https://lmstudio.ai/docs/app/api"
+
+[provider]
+base_url = "http://127.0.0.1:1234/v1"
+wire_api = "chat"

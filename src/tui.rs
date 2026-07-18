@@ -32,9 +32,10 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::agent::{self, Agent, AgentConfig, Capabilities, Detection};
 use crate::brand::{self, palette};
-use crate::domain::{mask, Provider, WireApi};
+use crate::domain::{mask, Model, Provider, WireApi};
 use crate::net::{self, catalog};
 use crate::preset::{self, Preset};
+use crate::ui;
 
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::try_init()?;
@@ -325,6 +326,8 @@ struct AgentEntry {
     config_path: PathBuf,
     providers: Vec<Provider>,
     active: Option<String>,
+    /// The model the agent is set to use, for agents that name one.
+    model: Option<String>,
     /// Why the config could not be parsed, if it could not be.
     error: Option<String>,
 }
@@ -340,12 +343,14 @@ impl AgentEntry {
             config_path: info.config_path.clone(),
             providers: Vec::new(),
             active: None,
+            model: None,
             error: None,
         };
         match handle.load() {
             Ok(config) => {
                 entry.providers = config.providers();
                 entry.active = config.active_provider();
+                entry.model = config.model();
             }
             // A missing config for an agent that is not installed is expected,
             // not something to shout about in the list.
@@ -379,6 +384,8 @@ enum Action {
     Use(Option<String>),
     /// Move the agent cursor onto a named agent.
     SelectAgent(String),
+    /// Choose which of the endpoint's models the agent should use.
+    Models,
     Detail,
     Filter,
     Add,
@@ -403,6 +410,7 @@ fn menu() -> Vec<Action> {
         Action::Detail,
         Action::Filter,
         Action::Use(None),
+        Action::Models,
         Action::Add,
         Action::Edit,
         Action::Delete,
@@ -424,6 +432,7 @@ impl Action {
             Action::Use(Some(id)) => format!("use {id}"),
             Action::Use(None) => "use provider".into(),
             Action::SelectAgent(id) => format!("agent {id}"),
+            Action::Models => "set model".into(),
             Action::Detail => "provider detail".into(),
             Action::Filter => "filter providers".into(),
             Action::Add => "add provider".into(),
@@ -447,6 +456,7 @@ impl Action {
         match self {
             Action::Use(_) => "use",
             Action::SelectAgent(_) => "agent",
+            Action::Models => "model",
             Action::Detail => "detail",
             Action::Filter => "filter",
             Action::Add => "add",
@@ -468,6 +478,7 @@ impl Action {
         match self {
             Action::Use(_) => "make this the provider the agent routes through".into(),
             Action::SelectAgent(_) => "edit this agent's config".into(),
+            Action::Models => "choose which model this agent uses".into(),
             Action::Detail => "show everything recorded about this provider".into(),
             Action::Filter => "narrow the provider list by id, host or model".into(),
             Action::Add => "add a provider to this agent".into(),
@@ -493,6 +504,7 @@ impl Action {
         Some(match self {
             Action::Use(_) => "u",
             Action::SelectAgent(_) => return None,
+            Action::Models => "m",
             Action::Detail => "enter",
             // `/` is not on the same key on every layout, so a chord backs it up.
             Action::Filter => "/ or ctrl+f",
@@ -525,6 +537,11 @@ impl Action {
             Action::Add | Action::Preset(_) | Action::Use(Some(_)) => no_agent(),
             // Enter on the agent pane only moves the focus, so it is always fine.
             Action::Detail if app.focus == Pane::Agents => None,
+            // Deliberately not gated on `per_provider_models`: that flag means
+            // the config stores a model *list*, not that the agent has a model.
+            // For the agents it is false for, this picker is the only way to
+            // choose one at all.
+            Action::Models => no_provider(),
             Action::Detail | Action::Edit | Action::Delete | Action::Check | Action::Use(None) => {
                 no_provider()
             }
@@ -533,9 +550,9 @@ impl Action {
                 .is_none_or(|agent| agent.providers.is_empty())
                 .then(|| "this agent has no providers to check".to_string()),
             Action::Sync { .. } => no_provider().or_else(|| {
-                app.agent()
-                    .filter(|agent| !agent.capabilities.per_provider_models)
-                    .map(|agent| format!("{} does not store a model list", agent.name))
+                app.agent().filter(|agent| !agent.capabilities.per_provider_models).map(|agent| {
+                    format!("{} stores no model list; press m to choose a model", agent.name)
+                })
             }),
         }
     }
@@ -548,6 +565,7 @@ impl Action {
                 app.provider_cursor = Cursor::default();
                 app.focus = Pane::Providers;
             }
+            Action::Models => app.schedule(Job::Models, "asking the endpoint what it serves…"),
             Action::Detail => app.open_detail(),
             Action::Filter => {
                 app.filter.editing = true;
@@ -827,13 +845,71 @@ impl CommandPalette {
     }
 
     fn rebuild(&mut self) {
-        self.matches = rank(&self.entries, &self.query);
+        self.matches = rank_by(&self.entries, &self.query, Action::label);
         self.cursor.clamp(self.matches.len());
     }
 
     fn selected(&self) -> Option<&Action> {
         self.matches.get(self.cursor.index()).and_then(|index| self.entries.get(*index))
     }
+}
+
+/// The models an endpoint answered with, filtered as you type.
+///
+/// Real gateways serve thirty or more, so this is a search box rather than a
+/// plain list.
+struct ModelPicker {
+    provider_id: String,
+    models: Vec<Model>,
+    catalog: Option<catalog::Catalog>,
+    /// What the agent uses today, so the picker can mark it.
+    current: Option<String>,
+    query: String,
+    matches: Vec<usize>,
+    cursor: Cursor,
+}
+
+impl ModelPicker {
+    fn new(provider_id: String, models: Vec<Model>, current: Option<String>) -> Self {
+        let mut picker = Self {
+            provider_id,
+            models,
+            // Prices are enrichment, never a reason to stall the interface.
+            catalog: catalog::Catalog::cached_only(),
+            current,
+            query: String::new(),
+            matches: Vec::new(),
+            cursor: Cursor::default(),
+        };
+        picker.rebuild();
+        // Open on the model already in use, so Enter is a no-op rather than a
+        // surprise when the user only meant to look.
+        if let Some(at) =
+            picker.matches.iter().position(|index| picker.is_current(&picker.models[*index]))
+        {
+            picker.cursor = Cursor { index: at };
+        }
+        picker
+    }
+
+    fn rebuild(&mut self) {
+        self.matches = rank_by(&self.models, &self.query, |model| model.id.clone());
+        self.cursor.clamp(self.matches.len());
+    }
+
+    fn selected(&self) -> Option<&Model> {
+        self.matches.get(self.cursor.index()).and_then(|index| self.models.get(*index))
+    }
+
+    fn is_current(&self, model: &Model) -> bool {
+        is_current_model(self.current.as_deref(), &model.id)
+    }
+}
+
+/// Whether `current` names `model_id`, in either the bare form most agents write
+/// or the `provider/model` form opencode writes.
+fn is_current_model(current: Option<&str>, model_id: &str) -> bool {
+    current.is_some_and(|current| current == model_id || current.ends_with(&format!("/{model_id}")))
 }
 
 /// How well `needle` matches `haystack` as a subsequence; lower is better.
@@ -865,14 +941,14 @@ fn subsequence_score(haystack: &str, needle: &str) -> Option<u32> {
     Some(score)
 }
 
-/// Indices of the actions whose label `query` matches, best first. Ties keep
-/// catalogue order so the list does not reshuffle while you type.
-fn rank(entries: &[Action], query: &str) -> Vec<usize> {
-    let mut scored: Vec<(u32, usize)> = entries
+/// Indices of the items whose label `query` matches, best first. Ties keep
+/// source order so the list does not reshuffle while you type.
+fn rank_by<T>(items: &[T], query: &str, label: impl Fn(&T) -> String) -> Vec<usize> {
+    let mut scored: Vec<(u32, usize)> = items
         .iter()
         .enumerate()
-        .filter_map(|(index, action)| {
-            subsequence_score(&action.label(), query).map(|score| (score, index))
+        .filter_map(|(index, item)| {
+            subsequence_score(&label(item), query).map(|score| (score, index))
         })
         .collect();
     scored.sort_by_key(|(score, index)| (*score, *index));
@@ -886,6 +962,7 @@ enum Overlay {
     Confirm(Confirm),
     Presets(PresetPicker),
     Palette(CommandPalette),
+    Models(ModelPicker),
 }
 
 /// Work that must be visibly announced before it blocks the event loop.
@@ -893,6 +970,8 @@ enum Overlay {
 enum Job {
     Check,
     CheckAll,
+    /// Ask the endpoint what it serves, then offer the answer as a picker.
+    Models,
     /// `prune` also drops models the endpoint no longer serves.
     Sync {
         prune: bool,
@@ -1149,6 +1228,7 @@ impl App {
             KeyCode::Char('/') => self.dispatch(Action::Filter),
             KeyCode::Char('?') => self.dispatch(Action::Help),
             KeyCode::Char('u') => self.dispatch(Action::Use(None)),
+            KeyCode::Char('m') => self.dispatch(Action::Models),
             KeyCode::Char('e') => self.dispatch(Action::Edit),
             KeyCode::Char('a') => self.dispatch(Action::Add),
             KeyCode::Char('d') => self.dispatch(Action::Delete),
@@ -1231,6 +1311,11 @@ impl App {
                     palette.cursor = Cursor { index };
                 }
             }
+            Some(Overlay::Models(picker)) => {
+                if let Some(index) = rows.row(at, picker.matches.len()) {
+                    picker.cursor = Cursor { index };
+                }
+            }
             _ => {}
         }
     }
@@ -1249,6 +1334,7 @@ impl App {
                 Overlay::Detail(detail) => detail.scroll = scrolled(detail.scroll),
                 Overlay::Presets(picker) => picker.cursor.step(delta, picker.presets.len()),
                 Overlay::Palette(palette) => palette.cursor.step(delta, palette.matches.len()),
+                Overlay::Models(picker) => picker.cursor.step(delta, picker.matches.len()),
                 Overlay::Form(_) | Overlay::Confirm(_) => {}
             }
             return;
@@ -1282,6 +1368,7 @@ impl App {
         match job {
             Job::Check => self.check_selected(),
             Job::CheckAll => self.check_all(terminal),
+            Job::Models => self.open_models(),
             Job::Sync { prune } => self.sync_selected(prune),
         }
     }
@@ -1342,6 +1429,49 @@ impl App {
         self.say(tone, summary);
     }
 
+    /// Ask the endpoint what it serves, recording its health and explaining any
+    /// failure in the status line.
+    ///
+    /// `None` means nothing usable came back, and the caller should open nothing.
+    fn discover(&mut self, provider: &Provider, agent_id: &str) -> Option<Vec<Model>> {
+        let discovery = net::discover_models(provider, net::DEFAULT_TIMEOUT, false);
+        let probe = discovery.probe.as_ref().or_else(|| {
+            self.say(Tone::Bad, format!("{} has no base URL", provider.id));
+            None
+        })?;
+
+        self.health.record(
+            agent_id,
+            &provider.id,
+            Health { alive: probe.alive(), millis: probe.latency.as_millis() },
+        );
+        if !probe.alive() {
+            self.say(Tone::Bad, format!("{} did not answer: {}", probe.url, probe.summary()));
+            return None;
+        }
+        if discovery.models.is_empty() {
+            self.say(Tone::Bad, format!("{} answered but listed no models", probe.url));
+            return None;
+        }
+        Some(discovery.models)
+    }
+
+    fn open_models(&mut self) {
+        let (Some(provider), Some(agent_id), current) = (
+            self.provider().cloned(),
+            self.agent().map(|a| a.id.clone()),
+            self.agent().and_then(|a| a.model.clone()),
+        ) else {
+            return;
+        };
+
+        let Some(models) = self.discover(&provider, &agent_id) else { return };
+        let count = models.len();
+        self.overlay =
+            Some(Overlay::Models(ModelPicker::new(provider.id.clone(), models, current)));
+        self.say(Tone::Info, format!("{} serves {count} model(s)", provider.id));
+    }
+
     fn sync_selected(&mut self, prune: bool) {
         let (Some(provider), Some(agent_id)) =
             (self.provider().cloned(), self.agent().map(|a| a.id.clone()))
@@ -1349,26 +1479,7 @@ impl App {
             return;
         };
 
-        let discovery = net::discover_models(&provider, net::DEFAULT_TIMEOUT, false);
-        let Some(probe) = &discovery.probe else {
-            self.say(Tone::Bad, format!("{} has no base URL", provider.id));
-            return;
-        };
-        self.health.record(
-            &agent_id,
-            &provider.id,
-            Health { alive: probe.alive(), millis: probe.latency.as_millis() },
-        );
-        if !probe.alive() {
-            self.say(Tone::Bad, format!("{} did not answer: {}", probe.url, probe.summary()));
-            return;
-        }
-        if discovery.models.is_empty() {
-            self.say(Tone::Bad, format!("{} answered but listed no models", probe.url));
-            return;
-        }
-
-        let models = discovery.models;
+        let Some(models) = self.discover(&provider, &agent_id) else { return };
         let id = provider.id.clone();
         self.apply("sync", move |config| {
             let served: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
@@ -1455,6 +1566,7 @@ impl App {
             Overlay::Confirm(confirm) => self.confirm_key(key, confirm),
             Overlay::Presets(picker) => self.preset_key(key, picker),
             Overlay::Palette(palette) => self.palette_key(key, raw, palette),
+            Overlay::Models(picker) => self.models_key(key, raw, picker),
         };
         // A handler that opened its own overlay — a form, the preset picker —
         // wins over the one it replaced.
@@ -1492,6 +1604,45 @@ impl App {
             _ => {}
         }
         Some(Overlay::Palette(palette))
+    }
+
+    fn models_key(
+        &mut self,
+        key: KeyEvent,
+        raw: KeyEvent,
+        mut picker: ModelPicker,
+    ) -> Option<Overlay> {
+        match key.code {
+            KeyCode::Esc => return None,
+            KeyCode::Enter => {
+                if let Some(model) = picker.selected() {
+                    let provider_id = picker.provider_id.clone();
+                    let model_id = model.id.clone();
+                    let reported = model_id.clone();
+                    self.apply("set model", move |config| {
+                        // Attributed to the endpoint it came from, so agents that
+                        // qualify the name resolve it against the right provider.
+                        config.set_model_for(&provider_id, &model_id)?;
+                        Ok(format!("model is now {reported}"))
+                    });
+                }
+                return None;
+            }
+            KeyCode::Up => picker.cursor.step(-1, picker.matches.len()),
+            KeyCode::Down => picker.cursor.step(1, picker.matches.len()),
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.rebuild();
+            }
+            KeyCode::Char(_) => {
+                if let KeyCode::Char(typed) = raw.code {
+                    picker.query.push(typed);
+                    picker.rebuild();
+                }
+            }
+            _ => {}
+        }
+        Some(Overlay::Models(picker))
     }
 
     fn form_key(&mut self, key: KeyEvent, raw: KeyEvent, mut form: Form) -> Option<Overlay> {
@@ -1647,14 +1798,17 @@ impl App {
         let preset_id = entry.id.clone();
         let provider_id = provider.id.clone();
         let default_model = entry.default_model.clone();
+        let model_provider = provider.id.clone();
         let agent_id = self.agent().map(|a| a.id.clone()).unwrap_or_default();
 
         self.apply("preset", move |config| {
             config.upsert_provider(&provider)?;
             if let Some(model) = &default_model {
-                // Not every agent tracks a model; failing to set one must not
-                // undo the endpoint that was just written.
-                let _ = config.set_model(model);
+                // Attributed to the preset's own endpoint rather than the active
+                // one, for the reason `set_model_for` exists. Not every agent
+                // tracks a model, and failing to set one must not undo the
+                // endpoint that was just written.
+                let _ = config.set_model_for(&model_provider, model);
             }
             Ok(format!("applied {preset_id}"))
         });
@@ -1723,6 +1877,11 @@ impl App {
             }
             Some(Overlay::Palette(palette)) => {
                 let (area, rows) = self.render_palette(frame, palette);
+                hits.overlay = Some(area);
+                hits.overlay_rows = rows;
+            }
+            Some(Overlay::Models(picker)) => {
+                let (area, rows) = render_models(frame, picker);
                 hits.overlay = Some(area);
                 hits.overlay_rows = rows;
             }
@@ -1860,6 +2019,12 @@ impl App {
                 Hint::plain("enter", "run"),
                 Hint::plain("esc", "close"),
             ],
+            Some(Overlay::Models(_)) => vec![
+                Hint::plain("type", "filter"),
+                Hint::plain("↑↓", "move"),
+                Hint::plain("enter", "use this model"),
+                Hint::plain("esc", "cancel"),
+            ],
             None if self.filter.editing => vec![
                 Hint::plain("type", "filter"),
                 Hint::plain("enter", "accept"),
@@ -1875,6 +2040,7 @@ impl App {
                         Action::Detail,
                         Action::Filter,
                         Action::Use(None),
+                        Action::Models,
                         Action::Add,
                         Action::Edit,
                         Action::Delete,
@@ -2062,6 +2228,7 @@ impl App {
             ),
             labelled("wire api", provider.wire_api.map(WireApi::as_str).unwrap_or(ABSENT)),
             labelled("active", if agent.is_active(&provider.id) { "yes" } else { "no" }),
+            labelled("agent model", agent.model.as_deref().unwrap_or(ABSENT)),
             labelled(
                 "health",
                 &match self.health.get(&agent.id, &provider.id) {
@@ -2117,67 +2284,149 @@ impl App {
     }
 
     fn render_palette(&self, frame: &mut Frame, palette: &CommandPalette) -> (Rect, RowsAt) {
-        dim_behind(frame);
+        let search = Search {
+            title: "commands",
+            query: &palette.query,
+            placeholder: "type to search every action",
+            empty: "no action matches that",
+            count: palette.matches.len(),
+            selected: palette.cursor.index(),
+        };
 
-        let screen = frame.area();
-        let height =
-            (palette.matches.len() as u16 + 4).clamp(5, screen.height.saturating_sub(4).max(5));
-        let area = centered_fixed(screen, 76, height);
-        let inner = overlay_frame(frame, area, "commands");
+        render_search_overlay(frame, search, |width| {
+            let columns = Columns::flexible(width, &[26, 18], 1, 16);
+            palette
+                .matches
+                .iter()
+                .filter_map(|index| palette.entries.get(*index))
+                .map(|action| {
+                    let mut row = Row::default();
+                    row.cell(&columns, &action.label(), Style::default().fg(palette::TEXT));
+                    row.cell(&columns, &action.description(), Style::default().fg(palette::MUTED));
+                    row.cell(
+                        &columns,
+                        &format!("{:>18}", action.binding().unwrap_or("")),
+                        Style::default().fg(palette::FAINT),
+                    );
+                    // Blocked actions are shown, not hidden, so the palette stays
+                    // a stable map of what the program can do.
+                    row.dim = action.unavailable(self).is_some();
+                    row
+                })
+                .collect()
+        })
+    }
+}
 
-        let [input, list] =
-            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+fn render_models(frame: &mut Frame, picker: &ModelPicker) -> (Rect, RowsAt) {
+    let search = Search {
+        title: &format!("models · {}", picker.provider_id),
+        query: &picker.query,
+        placeholder: "type to filter",
+        empty: "no model matches that",
+        count: picker.matches.len(),
+        selected: picker.cursor.index(),
+    };
 
-        let mut prompt = vec![
-            Span::styled(format!("{} ", brand::MARK), Style::default().fg(palette::ACCENT)),
-            Span::styled(palette.query.clone(), Style::default().fg(palette::TEXT)),
-            Span::styled(CURSOR_BAR, Style::default().fg(palette::ACCENT)),
-        ];
-        if palette.query.is_empty() {
-            prompt.push(Span::styled(
-                " type to search every action",
-                Style::default().fg(palette::FAINT),
-            ));
-        }
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(prompt),
-                Line::from(Span::styled(
-                    "─".repeat(input.width as usize),
-                    Style::default().fg(palette::ACCENT_MUTED),
-                )),
-            ]),
-            input,
-        );
-
-        if palette.matches.is_empty() {
-            render_centered(frame, list, &["no action matches that".to_string()]);
-            return (area, RowsAt::default());
-        }
-
-        let columns = Columns::flexible(list.width.saturating_sub(1) as usize, &[26, 18], 1, 16);
-        let rows = palette
+    render_search_overlay(frame, search, |width| {
+        let columns = Columns::flexible(width, &[1, 7, 7, 22], 1, 20);
+        picker
             .matches
             .iter()
-            .filter_map(|index| palette.entries.get(*index))
-            .map(|action| {
-                let blocked = action.unavailable(self).is_some();
+            .filter_map(|index| picker.models.get(*index))
+            .map(|model| {
+                let facts = picker.catalog.as_ref().and_then(|c| c.lookup(&model.id));
+                let limit = |value: Option<u64>| {
+                    value.map(ui::tokens).unwrap_or_else(|| ABSENT.to_string())
+                };
+
                 let mut row = Row::default();
-                row.cell(&columns, &action.label(), Style::default().fg(palette::TEXT));
-                row.cell(&columns, &action.description(), Style::default().fg(palette::MUTED));
                 row.cell(
                     &columns,
-                    &format!("{:>18}", action.binding().unwrap_or("")),
+                    if picker.is_current(model) { brand::MARK } else { " " },
+                    Style::default().fg(palette::ACCENT),
+                );
+                row.cell(&columns, &model.id, Style::default().fg(palette::TEXT));
+                row.cell(
+                    &columns,
+                    &limit(model.context_limit.or_else(|| facts.and_then(|f| f.context))),
+                    Style::default().fg(palette::MUTED),
+                );
+                row.cell(
+                    &columns,
+                    &limit(model.output_limit.or_else(|| facts.and_then(|f| f.output))),
+                    Style::default().fg(palette::MUTED),
+                );
+                row.cell(
+                    &columns,
+                    &facts.and_then(catalog::Facts::price).unwrap_or_else(|| ABSENT.to_string()),
                     Style::default().fg(palette::FAINT),
                 );
-                row.dim = blocked;
                 row
             })
-            .collect();
+            .collect()
+    })
+}
 
-        let rows_at = render_rows(frame, list, rows, palette.cursor.index(), true);
-        (area, rows_at)
+/// The parts of a search overlay that do not depend on what is being searched.
+struct Search<'a> {
+    title: &'a str,
+    query: &'a str,
+    placeholder: &'a str,
+    empty: &'a str,
+    count: usize,
+    selected: usize,
+}
+
+/// A query line above a list: the shape both the command palette and the model
+/// picker take.
+///
+/// `rows` is handed the width its columns have to fit into, because that is not
+/// known until the panel has been laid out.
+fn render_search_overlay(
+    frame: &mut Frame,
+    search: Search<'_>,
+    rows: impl FnOnce(usize) -> Vec<Row>,
+) -> (Rect, RowsAt) {
+    dim_behind(frame);
+
+    let screen = frame.area();
+    let height = (search.count as u16 + 4).clamp(5, screen.height.saturating_sub(4).max(5));
+    let area = centered_fixed(screen, 76, height);
+    let inner = overlay_frame(frame, area, search.title);
+
+    let [input, list] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+
+    let mut prompt = vec![
+        Span::styled(format!("{} ", brand::MARK), Style::default().fg(palette::ACCENT)),
+        Span::styled(search.query.to_string(), Style::default().fg(palette::TEXT)),
+        Span::styled(CURSOR_BAR, Style::default().fg(palette::ACCENT)),
+    ];
+    if search.query.is_empty() {
+        prompt.push(Span::styled(
+            format!(" {}", search.placeholder),
+            Style::default().fg(palette::FAINT),
+        ));
     }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(prompt),
+            Line::from(Span::styled(
+                "─".repeat(input.width as usize),
+                Style::default().fg(palette::ACCENT_MUTED),
+            )),
+        ]),
+        input,
+    );
+
+    if search.count == 0 {
+        render_centered(frame, list, &[search.empty.to_string()]);
+        return (area, RowsAt::default());
+    }
+
+    let rows = rows(list.width.saturating_sub(1) as usize);
+    let rows_at = render_rows(frame, list, rows, search.selected, true);
+    (area, rows_at)
 }
 
 /// Scroll-or-close, shared by every read-only overlay.
@@ -2596,32 +2845,17 @@ fn fit(text: &str, width: usize) -> String {
     }
 }
 
-/// Token counts as people say them: `1M`, `128K`, `4096`.
-fn compact_count(count: u64) -> String {
-    const MILLION: u64 = 1_000_000;
-    const THOUSAND: u64 = 1_000;
-
-    let (scaled, suffix) = if count >= MILLION {
-        (count as f64 / MILLION as f64, "M")
-    } else if count >= THOUSAND {
-        (count as f64 / THOUSAND as f64, "K")
-    } else {
-        return count.to_string();
-    };
-
-    let text = format!("{scaled:.1}");
-    let text = text.trim_end_matches('0').trim_end_matches('.');
-    format!("{text}{suffix}")
-}
-
 /// `1M ctx · 128K out`, or whichever half is known.
+///
+/// The rounding is [`ui::tokens`], shared with the CLI's model table so the same
+/// window is never described two ways.
 fn format_limits(context: Option<u64>, output: Option<u64>) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(context) = context {
-        parts.push(format!("{} ctx", compact_count(context)));
+        parts.push(format!("{} ctx", ui::tokens(context)));
     }
     if let Some(output) = output {
-        parts.push(format!("{} out", compact_count(output)));
+        parts.push(format!("{} out", ui::tokens(output)));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
@@ -2676,6 +2910,7 @@ mod render_tests {
             config_path: PathBuf::from("/home/u/.codex/config.toml"),
             providers: Vec::new(),
             active: Some("primary".into()),
+            model: Some("gpt-5.5".into()),
             error: None,
         };
         for (id, url, key) in [
@@ -2703,6 +2938,7 @@ mod render_tests {
             config_path: PathBuf::from("/home/u/.config/opencode/opencode.json"),
             providers: Vec::new(),
             active: None,
+            model: Some("codexsale/gpt-5.5".into()),
             error: None,
         };
 
@@ -2719,6 +2955,19 @@ mod render_tests {
             hits: Hits::default(),
             quit: false,
         }
+    }
+
+    /// A picker over what an endpoint answered with, as `Job::Models` builds it.
+    fn served_models() -> ModelPicker {
+        let mut big = Model::new("gpt-5.5");
+        big.context_limit = Some(400_000);
+        big.output_limit = Some(128_000);
+
+        ModelPicker::new(
+            "primary".into(),
+            vec![big, Model::new("gpt-4o-mini"), Model::new("claude-opus-4-8")],
+            Some("gpt-5.5".into()),
+        )
     }
 
     /// Render one frame and return it as text, so a failure shows the screen.
@@ -2760,6 +3009,7 @@ mod render_tests {
             Overlay::Detail(Detail { scroll: 0, catalog: None }),
             Overlay::About { scroll: 0 },
             Overlay::Palette(CommandPalette::new(&scene())),
+            Overlay::Models(served_models()),
             Overlay::Confirm(Confirm {
                 prompt: "delete primary?".into(),
                 agent_id: "codex".into(),
@@ -2771,6 +3021,48 @@ mod render_tests {
             let text = screen(&mut app, 120, 30);
             assert!(!text.trim().is_empty(), "overlay drew nothing");
         }
+    }
+
+    #[test]
+    fn the_model_picker_shows_limits_and_marks_the_one_in_use() {
+        let mut app = scene();
+        app.overlay = Some(Overlay::Models(served_models()));
+        let text = screen(&mut app, 120, 30);
+
+        assert!(text.contains("gpt-5.5"), "models missing:\n{text}");
+        assert!(text.contains("primary"), "endpoint not named in the title:\n{text}");
+        // Limits rounded the way the CLI's model table rounds them.
+        assert!(text.contains("400K") && text.contains("128K"), "limits missing:\n{text}");
+        // The model already in use carries the mark.
+        let marked = text
+            .lines()
+            .find(|line| line.contains("gpt-5.5") && !line.contains("mini"))
+            .expect("no row for the current model");
+        assert!(marked.contains(brand::MARK), "current model unmarked: {marked:?}");
+    }
+
+    #[test]
+    fn the_provider_detail_names_the_agents_current_model() {
+        let mut app = scene();
+        app.overlay = Some(Overlay::Detail(Detail { scroll: 0, catalog: None }));
+        let text = screen(&mut app, 120, 30);
+
+        assert!(text.contains("agent model"), "no model row in the detail:\n{text}");
+        assert!(text.contains("gpt-5.5"), "the model itself is missing:\n{text}");
+    }
+
+    #[test]
+    fn typing_in_the_model_picker_narrows_it_to_what_matches() {
+        let mut picker = served_models();
+        picker.query = "opus".into();
+        picker.rebuild();
+
+        let mut app = scene();
+        app.overlay = Some(Overlay::Models(picker));
+        let text = screen(&mut app, 120, 30);
+
+        assert!(text.contains("claude-opus-4-8"), "the match is missing:\n{text}");
+        assert!(!text.contains("gpt-4o-mini"), "a non-match survived the filter:\n{text}");
     }
 
     #[test]
@@ -2992,10 +3284,52 @@ mod tests {
     fn limits_read_the_way_people_say_them() {
         assert_eq!(format_limits(Some(1_000_000), Some(128_000)).unwrap(), "1M ctx · 128K out");
         assert_eq!(format_limits(Some(200_000), None).unwrap(), "200K ctx");
-        assert_eq!(format_limits(None, Some(8_192)).unwrap(), "8.2K out");
-        assert_eq!(format_limits(Some(1_500_000), None).unwrap(), "1.5M ctx");
+        assert_eq!(format_limits(None, Some(8_192)).unwrap(), "8K out");
+        assert_eq!(format_limits(Some(1_100_000), None).unwrap(), "1.1M ctx");
         assert_eq!(format_limits(Some(512), None).unwrap(), "512 ctx");
         assert_eq!(format_limits(None, None), None);
+    }
+
+    #[test]
+    fn the_current_model_is_recognised_bare_or_qualified() {
+        // Most agents name the model on its own.
+        assert!(is_current_model(Some("gpt-5.5"), "gpt-5.5"));
+        // opencode qualifies it with the provider it came from.
+        assert!(is_current_model(Some("codexsale/gpt-5.5"), "gpt-5.5"));
+        // A model id that itself contains a slash still matches exactly.
+        assert!(is_current_model(Some("xiaomi/mimo-v2.5-pro"), "xiaomi/mimo-v2.5-pro"));
+    }
+
+    #[test]
+    fn a_different_model_is_never_mistaken_for_the_current_one() {
+        assert!(!is_current_model(Some("gpt-5.5"), "gpt-4"));
+        assert!(!is_current_model(None, "gpt-5.5"));
+        // A suffix that is not a whole path segment must not count.
+        assert!(!is_current_model(Some("codexsale/not-gpt-5.5"), "gpt-5.5"));
+        // Nor may a bare id match a longer one that merely ends the same way.
+        assert!(!is_current_model(Some("mini-gpt-5.5"), "gpt-5.5"));
+    }
+
+    #[test]
+    fn filtering_models_ranks_the_closest_id_first() {
+        let models: Vec<Model> = ["gpt-5.5", "gpt-4o-mini", "claude-opus-4-8", "grok-3"]
+            .iter()
+            .map(|id| Model::new(*id))
+            .collect();
+        let ids = |query: &str| -> Vec<String> {
+            rank_by(&models, query, |model| model.id.clone())
+                .iter()
+                .map(|index| models[*index].id.clone())
+                .collect()
+        };
+
+        assert_eq!(ids("gpt5").first().unwrap(), "gpt-5.5");
+        assert_eq!(ids("opus"), vec!["claude-opus-4-8"]);
+        // A subsequence, not a substring: scattered letters still find it.
+        assert!(ids("gk").contains(&"grok-3".to_string()));
+        assert!(ids("zzz").is_empty());
+        // An empty query keeps every model, in the order the endpoint listed them.
+        assert_eq!(ids("").len(), 4);
     }
 
     #[test]
@@ -3077,13 +3411,13 @@ mod tests {
         ];
 
         let ranked: Vec<String> =
-            rank(&entries, "de").iter().map(|index| entries[*index].label()).collect();
+            rank_by(&entries, "de", Action::label).iter().map(|i| entries[*i].label()).collect();
         assert_eq!(ranked.first().unwrap(), "delete provider");
         assert!(ranked.contains(&"provider detail".to_string()));
         assert!(!ranked.contains(&"reload from disk".to_string()));
 
         // With no query every entry survives, in catalogue order.
-        assert_eq!(rank(&entries, ""), vec![0, 1, 2, 3]);
+        assert_eq!(rank_by(&entries, "", Action::label), vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -3122,6 +3456,7 @@ mod tests {
             "enter",
             "/ or ctrl+f",
             "u",
+            "m",
             "a",
             "e",
             "d",

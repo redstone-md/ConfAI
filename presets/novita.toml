@@ -1,0 +1,13 @@
+# Verified by requesting https://api.novita.ai/openai/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "novita"
+name = "Novita AI"
+description = "Open-weight models, priced per token"
+homepage = "https://novita.ai/docs"
+api_key_env = "NOVITA_API_KEY"
+
+[provider]
+base_url = "https://api.novita.ai/openai"
+wire_api = "chat"

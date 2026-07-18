@@ -1,0 +1,13 @@
+# Verified by requesting https://ai-gateway.vercel.sh/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "vercel"
+name = "Vercel AI Gateway"
+description = "One key across providers, with routing and spend limits"
+homepage = "https://vercel.com/docs/ai-gateway"
+api_key_env = "AI_GATEWAY_API_KEY"
+
+[provider]
+base_url = "https://ai-gateway.vercel.sh/v1"
+wire_api = "chat"

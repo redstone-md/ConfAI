@@ -1,0 +1,12 @@
+# Verified by requesting http://localhost:11434/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "ollama"
+name = "Ollama (local)"
+description = "A local Ollama server; no key needed"
+homepage = "https://docs.ollama.com/"
+
+[provider]
+base_url = "http://localhost:11434/v1"
+wire_api = "chat"

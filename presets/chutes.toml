@@ -1,0 +1,13 @@
+# Verified by requesting https://llm.chutes.ai/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "chutes"
+name = "Chutes"
+description = "Decentralised serving of open-weight models"
+homepage = "https://chutes.ai/"
+api_key_env = "CHUTES_API_KEY"
+
+[provider]
+base_url = "https://llm.chutes.ai/v1"
+wire_api = "chat"

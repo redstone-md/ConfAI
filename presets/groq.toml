@@ -1,0 +1,13 @@
+# Verified by requesting https://api.groq.com/openai/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "groq"
+name = "Groq"
+description = "Open-weight models on Groq's LPU hardware"
+homepage = "https://console.groq.com/docs"
+api_key_env = "GROQ_API_KEY"
+
+[provider]
+base_url = "https://api.groq.com/openai/v1"
+wire_api = "chat"

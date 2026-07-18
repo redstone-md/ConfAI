@@ -1,0 +1,13 @@
+# Verified by requesting https://api.anthropic.com/v1/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "anthropic"
+name = "Anthropic"
+description = "Anthropic direct"
+homepage = "https://docs.anthropic.com/en/api"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[provider]
+base_url = "https://api.anthropic.com/v1"
+wire_api = "anthropic"

@@ -139,6 +139,19 @@ fn visible_width(text: &str) -> usize {
     width
 }
 
+/// Token counts read better as 200K than as 200000.
+///
+/// The CLI and the TUI both list model limits, so the rounding lives here and
+/// the two cannot end up disagreeing about how big a context window is.
+pub fn tokens(count: u64) -> String {
+    match count {
+        n if n >= 1_000_000 && n % 1_000_000 == 0 => format!("{}M", n / 1_000_000),
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{}K", n / 1_000),
+        n => n.to_string(),
+    }
+}
+
 /// Shorten to `max` characters, marking the cut so a truncated URL is never
 /// mistaken for a real one.
 pub fn truncate(text: &str, max: usize) -> String {
@@ -174,6 +187,16 @@ mod tests {
     fn width_ignores_ansi_escapes() {
         assert_eq!(visible_width("\x1b[32myes\x1b[0m"), 3);
         assert_eq!(visible_width("plain"), 5);
+    }
+
+    #[test]
+    fn token_counts_round_to_something_readable() {
+        assert_eq!(tokens(1_000_000), "1M");
+        assert_eq!(tokens(1_100_000), "1.1M");
+        assert_eq!(tokens(2_000_000), "2M");
+        assert_eq!(tokens(128_000), "128K");
+        assert_eq!(tokens(8_192), "8K");
+        assert_eq!(tokens(512), "512");
     }
 
     #[test]

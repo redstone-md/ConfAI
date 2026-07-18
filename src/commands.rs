@@ -411,8 +411,8 @@ fn provider_models(
         table.row([
             if selected { ui::green("*") } else { " ".into() },
             model.id.clone(),
-            model.context_limit.map(count).unwrap_or_else(|| ui::dim("-")),
-            model.output_limit.map(count).unwrap_or_else(|| ui::dim("-")),
+            model.context_limit.map(ui::tokens).unwrap_or_else(|| ui::dim("-")),
+            model.output_limit.map(ui::tokens).unwrap_or_else(|| ui::dim("-")),
             facts.and_then(|f| f.price()).unwrap_or_else(|| ui::dim("-")),
         ]);
     }
@@ -427,16 +427,6 @@ fn provider_models(
         ))
     );
     Ok(())
-}
-
-/// Token counts read better as 200K than as 200000.
-fn count(tokens: u64) -> String {
-    match tokens {
-        n if n >= 1_000_000 && n % 1_000_000 == 0 => format!("{}M", n / 1_000_000),
-        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
-        n if n >= 1_000 => format!("{}K", n / 1_000),
-        n => n.to_string(),
-    }
 }
 
 fn provider_sync(
@@ -666,7 +656,10 @@ fn preset_apply(
             }
         }
         if let Some(model) = &entry.default_model {
-            let _ = config.set_model(model);
+            // Attributed to the preset's own endpoint, not whichever one happens
+            // to be active: on opencode a bare name resolves against the active
+            // provider, which would file this model under the wrong gateway.
+            let _ = config.set_model_for(&provider.id, model);
         }
         config.save()?;
 

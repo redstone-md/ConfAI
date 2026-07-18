@@ -1,0 +1,13 @@
+# Verified by requesting https://api.deepseek.com/models: the endpoint answers and speaks
+# the OpenAI wire format. Models are discovered with `confai provider sync`
+# rather than listed here, so this file cannot go stale.
+
+id = "deepseek"
+name = "DeepSeek"
+description = "DeepSeek direct"
+homepage = "https://api-docs.deepseek.com/"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[provider]
+base_url = "https://api.deepseek.com"
+wire_api = "chat"

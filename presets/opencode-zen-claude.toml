@@ -1,0 +1,13 @@
+# Claude and Qwen on opencode Zen, served over /v1/messages.
+
+id = "opencode-zen-claude"
+name = "OpenCode Zen (Claude)"
+description = "opencode's gateway, Claude and Qwen over the messages API"
+homepage = "https://opencode.ai/docs/zen/"
+api_key_env = "OPENCODE_API_KEY"
+
+[provider]
+id = "opencode-zen-claude"
+display_name = "OpenCode Zen (Claude)"
+base_url = "https://opencode.ai/zen/v1"
+wire_api = "anthropic"
