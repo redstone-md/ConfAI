@@ -332,6 +332,12 @@ impl AgentConfig for OpenCodeConfig {
         Ok(())
     }
 
+    fn set_model_for(&mut self, provider_id: &str, model: &str) -> Result<()> {
+        let qualified =
+            if model.contains('/') { model.to_string() } else { format!("{provider_id}/{model}") };
+        self.set_model(&qualified)
+    }
+
     fn render(&self) -> String {
         json::render(&self.root)
     }

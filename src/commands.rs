@@ -104,6 +104,9 @@ fn provider(command: ProviderCommand) -> Result<()> {
         ProviderCommand::Check { id, target, timeout } => {
             provider_check(id.as_deref(), &target, Duration::from_secs(timeout))
         }
+        ProviderCommand::Models { id, target, select, refresh } => {
+            provider_models(id.as_deref(), &target, select.as_deref(), refresh)
+        }
         ProviderCommand::Sync { id, target, refresh, prune, dry_run } => {
             provider_sync(&id, &target, refresh, prune, dry_run)
         }
@@ -340,6 +343,102 @@ fn provider_check(id: Option<&str>, target: &Target, timeout: Duration) -> Resul
     Ok(())
 }
 
+/// List what an endpoint serves, and optionally select one of those models.
+///
+/// This works for every agent, including the ones whose config has no
+/// per-provider model list. Those agents still name a model, and until now the
+/// list an endpoint answered with was discovered and then thrown away.
+fn provider_models(
+    id: Option<&str>,
+    target: &Target,
+    select: Option<&str>,
+    refresh: bool,
+) -> Result<()> {
+    let entry = resolve_one(target)?;
+    let mut config = entry.load()?;
+
+    let provider = match id {
+        Some(id) => config
+            .provider(id)
+            .with_context(|| format!("{} has no provider {id:?}", entry.info().name))?,
+        None => {
+            let active = config.active_provider().with_context(|| {
+                format!("{} has no active provider; name one", entry.info().name)
+            })?;
+            config.provider(&active).with_context(|| {
+                format!("{} points at {active:?}, which is not configured", entry.info().name)
+            })?
+        }
+    };
+
+    let discovery = net::discover_models(&provider, net::DEFAULT_TIMEOUT, refresh);
+    let Some(probe) = &discovery.probe else {
+        bail!("provider {:?} has no base URL to query", provider.id);
+    };
+    if !probe.alive() {
+        bail!("{} did not answer: {}", probe.url, probe.summary());
+    }
+
+    if let Some(wanted) = select {
+        let model = discovery
+            .models
+            .iter()
+            .find(|model| model.id == wanted)
+            .with_context(|| format!("{} does not serve {wanted:?}", provider.id))?;
+
+        config.set_model_for(&provider.id, &model.id)?;
+        config.save()?;
+        println!(
+            "{} {} now uses {} from {}",
+            ui::green("✓"),
+            entry.info().name,
+            ui::bold(&model.id),
+            provider.id
+        );
+        return Ok(());
+    }
+
+    let catalog = net::catalog::Catalog::cached_only();
+    let current = config.model();
+    let mut table = Table::new(["", "model", "context", "output", "price"]);
+
+    for model in &discovery.models {
+        let facts = catalog.as_ref().and_then(|c| c.lookup(&model.id));
+        let selected = current
+            .as_deref()
+            .is_some_and(|m| m == model.id || m.ends_with(&format!("/{}", model.id)));
+
+        table.row([
+            if selected { ui::green("*") } else { " ".into() },
+            model.id.clone(),
+            model.context_limit.map(count).unwrap_or_else(|| ui::dim("-")),
+            model.output_limit.map(count).unwrap_or_else(|| ui::dim("-")),
+            facts.and_then(|f| f.price()).unwrap_or_else(|| ui::dim("-")),
+        ]);
+    }
+
+    println!("{} {}\n", ui::bold(&provider.id), ui::dim(probe.url.as_str()));
+    print!("{}", table.render());
+    println!(
+        "\n{}",
+        ui::dim(&format!(
+            "select one with `confai provider models {} --select <model>`",
+            provider.id
+        ))
+    );
+    Ok(())
+}
+
+/// Token counts read better as 200K than as 200000.
+fn count(tokens: u64) -> String {
+    match tokens {
+        n if n >= 1_000_000 && n % 1_000_000 == 0 => format!("{}M", n / 1_000_000),
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{}K", n / 1_000),
+        n => n.to_string(),
+    }
+}
+
 fn provider_sync(
     id: &str,
     target: &Target,
@@ -424,9 +523,11 @@ fn sync_into(
 
     if !config.info().capabilities.per_provider_models {
         println!(
-            "{} {} does not store a model list; {} model(s) found, nothing written",
+            "{} {} stores no model list, so nothing was written. {} serves {} model(s) — \
+             pick one with `confai provider models {id} --select <model>`",
             ui::dim("·"),
             config.info().name,
+            id,
             discovery.models.len()
         );
         return Ok(SyncOutcome { written: 0, pruned: 0 });

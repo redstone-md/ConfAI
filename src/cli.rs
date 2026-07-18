@@ -145,6 +145,20 @@ pub enum ProviderCommand {
         timeout: u64,
     },
 
+    /// List the models an endpoint serves, with their limits and prices.
+    Models {
+        /// Endpoint to ask. Omit to use the agent's active one.
+        id: Option<String>,
+        #[command(flatten)]
+        target: Target,
+        /// Select one of them as the agent's model.
+        #[arg(long, value_name = "MODEL")]
+        select: Option<String>,
+        /// Re-download the models.dev catalogue instead of using the daily cache.
+        #[arg(long)]
+        refresh: bool,
+    },
+
     /// Pull an endpoint's model list into the config, with limits from models.dev.
     Sync {
         id: String,

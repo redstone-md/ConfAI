@@ -105,6 +105,16 @@ pub trait AgentConfig {
 
     fn set_model(&mut self, model: &str) -> Result<()>;
 
+    /// Select `model`, attributing it to the endpoint it came from.
+    ///
+    /// Most agents name a model on its own. opencode names it `provider/model`,
+    /// so picking a model from a provider that is not the active one would
+    /// otherwise silently resolve against the wrong endpoint.
+    fn set_model_for(&mut self, provider_id: &str, model: &str) -> Result<()> {
+        let _ = provider_id;
+        self.set_model(model)
+    }
+
     /// Serialise the edited document. Byte-identical to the input when nothing changed.
     fn render(&self) -> String;
 
