@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="220" viewBox="0 0 880 220" role="img" aria-label="ConfAI — one editor for every AI agent's config, by redstone.md">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d1a19"/>
+      <stop offset="1" stop-color="#131110"/>
+    </linearGradient>
+    <linearGradient id="ember" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e8574c"/>
+      <stop offset="1" stop-color="#b8352d"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="880" height="220" rx="18" fill="url(#plate)"/>
+  <rect x="0.5" y="0.5" width="879" height="219" rx="17.5" fill="none" stroke="#3a2422"/>
+
+  <!-- The mark: a redstone diamond, cut by the seam that ConfAI closes. -->
+  <g transform="translate(96 110)">
+    <path d="M0-46 46 0 0 46-46 0Z" fill="url(#ember)"/>
+    <path d="M0-46 46 0 0 46-46 0Z" fill="none" stroke="#f08a80" stroke-width="1.5" opacity="0.55"/>
+    <path d="M0-46 0 46" stroke="#131110" stroke-width="4"/>
+    <circle cx="0" cy="0" r="8.5" fill="#131110"/>
+    <circle cx="0" cy="0" r="4" fill="#f4a49b"/>
+  </g>
+
+  <text x="186" y="104" font-family="ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace" font-size="62" font-weight="700" letter-spacing="-1.5" fill="#e2dfdb">Conf<tspan fill="#e8574c">AI</tspan></text>
+  <text x="190" y="140" font-family="ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace" font-size="19" fill="#85807a">one editor for every AI agent&#39;s config</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace" font-size="15" fill="#58544f">
+    <text x="190" y="176">redstone.md</text>
+    <text x="308" y="176" fill="#3a2422">·</text>
+    <text x="328" y="176">Rust</text>
+    <text x="390" y="176" fill="#3a2422">·</text>
+    <text x="410" y="176">MIT</text>
+  </g>
+
+  <!-- Three configs, one editor: the diagram states the whole premise. -->
+  <g transform="translate(676 62)" font-family="ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace" font-size="14">
+    <text x="0" y="0" fill="#78726b">codex</text>
+    <text x="0" y="26" fill="#78726b">claude</text>
+    <text x="0" y="52" fill="#78726b">opencode</text>
+    <g stroke="#6b3a35" stroke-width="2" fill="none" stroke-linecap="round">
+      <path d="M96 -5 H126"/>
+      <path d="M96 21 H126"/>
+      <path d="M96 47 H126"/>
+      <path d="M126 -5 V47"/>
+    </g>
+    <path d="M126 21 H154" stroke="#e8574c" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="160" cy="21" r="7" fill="#e8574c" opacity="0.25"/>
+    <circle cx="160" cy="21" r="4.5" fill="#e8574c"/>
+  </g>
+</svg>

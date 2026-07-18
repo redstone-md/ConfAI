@@ -1,0 +1,3 @@
+/target
+**/*.confai.bak
+**/*.confai.tmp.*

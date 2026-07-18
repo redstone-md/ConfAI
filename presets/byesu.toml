@@ -1,0 +1,16 @@
+# Byesu — a New API gateway, so the surface is OpenAI-compatible.
+#
+# The model list is deliberately empty: the gateway answers `/v1/models` once it
+# has a token, and `confai provider sync byesu` pulls the real list from there
+# and fills in context limits from models.dev. Hard-coding models here would go
+# stale the moment the gateway changes its catalogue.
+
+id = "byesu"
+name = "Byesu"
+description = "Byesu gateway (New API), OpenAI-compatible /v1"
+homepage = "https://byesu.com"
+api_key_env = "BYESU_API_KEY"
+
+[provider]
+base_url = "https://byesu.com/v1"
+wire_api = "chat"
