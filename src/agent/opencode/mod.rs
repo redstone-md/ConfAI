@@ -421,12 +421,12 @@ fn read_mcp(name: &str, entry: &Value) -> mcp::Server {
     let transport = match entry.get("url").and_then(Value::as_str) {
         Some(url) => mcp::Transport::Remote { url: url.to_string() },
         None => {
-            let mut line = entry
+            let line: Vec<String> = entry
                 .get("command")
                 .and_then(Value::as_array)
                 .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
-                .unwrap_or_else(Vec::new)
-                .into_iter();
+                .unwrap_or_default();
+            let mut line = line.into_iter();
             mcp::Transport::Stdio { command: line.next().unwrap_or_default(), args: line.collect() }
         }
     };

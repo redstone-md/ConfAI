@@ -255,6 +255,32 @@ impl AgentConfig for ClaudeConfig {
     }
 }
 
+/// Claude Code stores a stdio server as a command plus a separate `args` list,
+/// and has no flag to disable one without removing it.
+fn read_mcp(name: &str, entry: &Value) -> mcp::Server {
+    let transport = match entry.get("url").and_then(Value::as_str) {
+        Some(url) => mcp::Transport::Remote { url: url.to_string() },
+        None => mcp::Transport::Stdio {
+            command: entry.get("command").and_then(Value::as_str).unwrap_or_default().to_string(),
+            args: entry
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default(),
+        },
+    };
+
+    let env = entry
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()
+        })
+        .unwrap_or_default();
+
+    mcp::Server { name: name.to_string(), transport, env, enabled: None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,30 +385,4 @@ mod tests {
         assert_eq!(cfg.root["env"]["OTHER"], j!("keep"), "clobbered an unrelated variable");
         assert!(cfg.active_provider().is_none());
     }
-}
-
-/// Claude Code stores a stdio server as a command plus a separate `args` list,
-/// and has no flag to disable one without removing it.
-fn read_mcp(name: &str, entry: &Value) -> mcp::Server {
-    let transport = match entry.get("url").and_then(Value::as_str) {
-        Some(url) => mcp::Transport::Remote { url: url.to_string() },
-        None => mcp::Transport::Stdio {
-            command: entry.get("command").and_then(Value::as_str).unwrap_or_default().to_string(),
-            args: entry
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
-                .unwrap_or_default(),
-        },
-    };
-
-    let env = entry
-        .get("env")
-        .and_then(Value::as_object)
-        .map(|env| {
-            env.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()
-        })
-        .unwrap_or_default();
-
-    mcp::Server { name: name.to_string(), transport, env, enabled: None }
 }
