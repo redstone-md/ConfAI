@@ -7,10 +7,22 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("presets");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let generated = format!(
+        "{}\n{}",
+        bake(&root.join("presets"), "BUILTIN_PRESETS", "endpoint presets from `presets/`"),
+        bake(&root.join("presets/mcp"), "BUILTIN_MCP_PRESETS", "MCP presets from `presets/mcp/`"),
+    );
+
+    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("presets.rs");
+    fs::write(&out, generated).unwrap_or_else(|err| panic!("writing {}: {err}", out.display()));
+}
+
+/// Emit a `const` holding every `*.toml` directly inside `dir`.
+fn bake(dir: &Path, name: &str, doc: &str) -> String {
     println!("cargo:rerun-if-changed={}", dir.display());
 
-    let mut entries: Vec<String> = fs::read_dir(&dir)
+    let mut entries: Vec<String> = fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("reading {}: {err}", dir.display()))
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
@@ -22,13 +34,10 @@ fn main() {
         .collect();
     entries.sort();
 
-    let generated = format!(
-        "/// Preset sources baked in at build time from `presets/`.\n\
-         pub const BUILTIN_PRESETS: [&str; {}] = [\n{}\n];\n",
+    format!(
+        "/// Sources baked in at build time: {doc}.\n\
+         pub const {name}: [&str; {}] = [\n{}\n];\n",
         entries.len(),
         entries.join("\n")
-    );
-
-    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("presets.rs");
-    fs::write(&out, generated).unwrap_or_else(|err| panic!("writing {}: {err}", out.display()));
+    )
 }

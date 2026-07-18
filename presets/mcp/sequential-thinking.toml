@@ -1,0 +1,8 @@
+id = "sequential-thinking"
+name = "Sequential Thinking"
+description = "Structured step-by-step reasoning"
+homepage = "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking"
+
+[server]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]

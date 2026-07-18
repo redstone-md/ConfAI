@@ -14,6 +14,7 @@ pub mod brand;
 pub mod cli;
 pub mod commands;
 pub mod domain;
+pub mod mcp;
 pub mod net;
 pub mod preset;
 pub mod store;

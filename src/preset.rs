@@ -162,13 +162,119 @@ pub fn find(id: &str) -> Result<Preset> {
     bail!("unknown preset {id:?}; available: {}", known.join(", "))
 }
 
+/// A recipe for one MCP server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpPreset {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    /// Variables the server needs before it will work. Reported, never invented.
+    #[serde(default)]
+    pub requires_env: Vec<String>,
+    server: ServerSpec,
+    #[serde(skip)]
+    pub origin: Origin,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServerSpec {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+impl McpPreset {
+    /// The server this preset would write, under `name` or its own id.
+    pub fn server(&self, name: Option<&str>) -> Result<crate::mcp::Server> {
+        let transport = match (&self.server.command, &self.server.url) {
+            (_, Some(url)) => crate::mcp::Transport::Remote { url: url.clone() },
+            (Some(command), None) => crate::mcp::Transport::Stdio {
+                command: command.clone(),
+                args: self.server.args.clone(),
+            },
+            (None, None) => {
+                bail!("MCP preset {:?} names neither a command nor a url", self.id)
+            }
+        };
+
+        Ok(crate::mcp::Server {
+            name: name.unwrap_or(&self.id).to_string(),
+            transport,
+            env: self.server.env.clone(),
+            enabled: None,
+        })
+    }
+
+    /// The variables this preset wants that are not set in this environment.
+    pub fn missing_env(&self) -> Vec<&str> {
+        self.requires_env
+            .iter()
+            .filter(|var| std::env::var_os(var.as_str()).is_none())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// Every MCP preset, built-ins first, with user files overriding same-id built-ins.
+pub fn mcp_all() -> Result<Vec<McpPreset>> {
+    let mut presets: Vec<McpPreset> = Vec::new();
+
+    for (index, source) in BUILTIN_MCP_PRESETS.iter().enumerate() {
+        let mut preset: McpPreset = toml_edit::de::from_str(source)
+            .with_context(|| format!("parsing built-in MCP preset #{index}"))?;
+        preset.origin = Origin::Builtin;
+        presets.push(preset);
+    }
+
+    for (path, source) in sources_in(mcp_user_dir())? {
+        let mut preset: McpPreset = toml_edit::de::from_str(&source)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        preset.origin = Origin::User;
+        match presets.iter().position(|p| p.id == preset.id) {
+            Some(index) => presets[index] = preset,
+            None => presets.push(preset),
+        }
+    }
+
+    presets.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(presets)
+}
+
+pub fn mcp_find(id: &str) -> Result<McpPreset> {
+    let presets = mcp_all()?;
+    let wanted = id.trim().to_ascii_lowercase();
+    if let Some(preset) = presets.iter().find(|p| p.id.to_ascii_lowercase() == wanted) {
+        return Ok(preset.clone());
+    }
+    let known: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
+    bail!("unknown MCP preset {id:?}; available: {}", known.join(", "))
+}
+
 /// Where user-contributed presets live.
 pub fn user_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".confai").join("presets"))
 }
 
+pub fn mcp_user_dir() -> Option<PathBuf> {
+    user_dir().map(|dir| dir.join("mcp"))
+}
+
 fn user_sources() -> Result<Vec<(PathBuf, String)>> {
-    let Some(dir) = user_dir().filter(|dir| dir.is_dir()) else {
+    sources_in(user_dir())
+}
+
+/// Read every `*.toml` directly inside `dir`, sorted, treating a missing
+/// directory as empty.
+fn sources_in(dir: Option<PathBuf>) -> Result<Vec<(PathBuf, String)>> {
+    let Some(dir) = dir.filter(|dir| dir.is_dir()) else {
         return Ok(Vec::new());
     };
 

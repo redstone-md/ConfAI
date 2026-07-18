@@ -1,0 +1,8 @@
+id = "memory"
+name = "Memory"
+description = "A knowledge graph the agent can write to and recall"
+homepage = "https://github.com/modelcontextprotocol/servers/tree/main/src/memory"
+
+[server]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]

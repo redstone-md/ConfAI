@@ -1,0 +1,8 @@
+id = "filesystem"
+name = "Filesystem"
+description = "Read and write files under paths you allow"
+homepage = "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"
+
+[server]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem"]

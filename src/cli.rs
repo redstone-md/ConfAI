@@ -53,6 +53,10 @@ pub enum Command {
     #[command(subcommand)]
     Preset(PresetCommand),
 
+    /// List, add, remove and check the MCP servers an agent launches.
+    #[command(subcommand)]
+    Mcp(McpCommand),
+
     /// Show or set the model an agent uses.
     Model {
         /// Model to select. Omit to print the current one.
@@ -173,6 +177,84 @@ pub enum ProviderCommand {
         /// Print what would change without writing it.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// List the MCP servers configured across the selected agents.
+    #[command(visible_alias = "ls")]
+    List {
+        #[command(flatten)]
+        target: Target,
+    },
+
+    /// Check that each server could actually start.
+    Doctor {
+        #[command(flatten)]
+        target: Target,
+        /// Seconds to wait for a remote server.
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
+
+    /// Add a server, or edit the fields you pass on an existing one.
+    Add {
+        /// Name the agent will know it by.
+        name: String,
+        #[command(flatten)]
+        target: Target,
+        /// Executable to launch for a stdio server.
+        #[arg(long, value_name = "PROGRAM", conflicts_with = "url")]
+        command: Option<String>,
+        /// Argument for the command, repeatable and order-preserving.
+        #[arg(long = "arg", value_name = "ARG")]
+        args: Vec<String>,
+        /// Endpoint for a remote server instead of a command.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Environment variable, repeatable: `--env TOKEN=abc`.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+    },
+
+    /// Remove a server.
+    #[command(visible_alias = "rm")]
+    Remove {
+        name: String,
+        #[command(flatten)]
+        target: Target,
+    },
+
+    /// Turn a server on or off without removing it, where the agent allows it.
+    Toggle {
+        name: String,
+        /// Turn it off rather than on.
+        #[arg(long)]
+        off: bool,
+        #[command(flatten)]
+        target: Target,
+    },
+
+    /// Recipes for well-known MCP servers.
+    #[command(subcommand)]
+    Preset(McpPresetCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpPresetCommand {
+    /// List available MCP server recipes.
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Write a recipe into the selected agents.
+    Apply {
+        id: String,
+        #[command(flatten)]
+        target: Target,
+        /// Name to record it under. Defaults to the preset id.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 

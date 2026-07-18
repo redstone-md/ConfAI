@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 
 use crate::domain::Provider;
+use crate::mcp;
 use crate::store;
 
 /// What an agent can express in its config, so the UI offers only real choices.
@@ -24,6 +25,8 @@ pub struct Capabilities {
     pub per_provider_models: bool,
     /// An API key lives in the config rather than only in the environment.
     pub inline_api_key: bool,
+    /// MCP servers can be listed and edited.
+    pub mcp: bool,
 }
 
 /// Static description of an agent: enough to detect and locate it without loading anything.
@@ -113,6 +116,34 @@ pub trait AgentConfig {
     fn set_model_for(&mut self, provider_id: &str, model: &str) -> Result<()> {
         let _ = provider_id;
         self.set_model(model)
+    }
+
+    /// MCP servers this agent is configured to launch.
+    ///
+    /// Defaulted so a backend that has not mapped MCP yet reports nothing rather
+    /// than failing; [`Capabilities::mcp`] is what tells the UI to offer it.
+    fn mcp_servers(&self) -> Vec<mcp::Server> {
+        Vec::new()
+    }
+
+    fn upsert_mcp(&mut self, server: &mcp::Server) -> Result<()> {
+        let _ = server;
+        bail!("{} does not support editing MCP servers", self.info().name)
+    }
+
+    fn remove_mcp(&mut self, name: &str) -> Result<bool> {
+        let _ = name;
+        bail!("{} does not support editing MCP servers", self.info().name)
+    }
+
+    /// Turn a server off without deleting it, where the agent allows that.
+    fn set_mcp_enabled(&mut self, name: &str, enabled: bool) -> Result<()> {
+        let _ = (name, enabled);
+        bail!("{} cannot disable an MCP server; remove it instead", self.info().name)
+    }
+
+    fn mcp_server(&self, name: &str) -> Option<mcp::Server> {
+        self.mcp_servers().into_iter().find(|s| s.name == name)
     }
 
     /// Serialise the edited document. Byte-identical to the input when nothing changed.

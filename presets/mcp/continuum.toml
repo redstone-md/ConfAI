@@ -1,0 +1,13 @@
+# Run through npx, which is what Continuum's own README leads with. The package
+# `continuum-mcp` is published on npm. If you would rather not go through npx,
+# `cargo install --git https://github.com/redstone-md/continuum continuum-adapter`
+# gives you a `continuum-adapter` binary to use as the command instead.
+
+id = "continuum"
+name = "Continuum"
+description = "Persistent memory and context continuity across sessions"
+homepage = "https://github.com/redstone-md/continuum"
+
+[server]
+command = "npx"
+args = ["-y", "continuum-mcp"]

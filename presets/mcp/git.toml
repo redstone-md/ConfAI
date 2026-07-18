@@ -1,0 +1,8 @@
+id = "git"
+name = "Git"
+description = "Read history, diffs and blame from a repository"
+homepage = "https://github.com/modelcontextprotocol/servers/tree/main/src/git"
+
+[server]
+command = "uvx"
+args = ["mcp-server-git"]

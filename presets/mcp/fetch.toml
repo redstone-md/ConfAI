@@ -1,0 +1,8 @@
+id = "fetch"
+name = "Fetch"
+description = "Fetch a URL and hand back its content as text"
+homepage = "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch"
+
+[server]
+command = "uvx"
+args = ["mcp-server-fetch"]

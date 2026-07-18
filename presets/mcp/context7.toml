@@ -1,0 +1,8 @@
+id = "context7"
+name = "Context7"
+description = "Up-to-date library and framework documentation"
+homepage = "https://github.com/upstash/context7"
+
+[server]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]

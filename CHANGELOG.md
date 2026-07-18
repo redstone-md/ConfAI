@@ -33,10 +33,18 @@ version says what it means: the interfaces are still free to move.
   `confai preset apply <id>`, plus `preset list` and `preset show`. Built-in
   presets live in `presets/` and are baked into the binary at build time; user
   presets in `~/.confai/presets/` override a built-in with the same id.
-  Twenty-five are included, covering OpenCode Zen, OpenRouter, OpenAI,
+  Twenty-six are included, covering OpenCode Zen, OpenRouter, OpenAI,
   Anthropic, Groq, xAI, Mistral, Cerebras, Together, DeepSeek, DeepInfra,
   Fireworks, Moonshot, Z.ai, Chutes, Baseten, Vercel AI Gateway, Venice,
-  Novita, Ollama and LM Studio.
+  Novita, Ollama, LM Studio and Byesu.
+- MCP servers: `confai mcp list`, `add`, `remove`, `toggle` and `doctor` across
+  every agent that stores them, each of which spells them differently —
+  `mcp_servers` in Codex's TOML, `mcpServers` in `~/.claude.json`, and `mcp` in
+  opencode's config, where the command is one list rather than a program plus
+  arguments. `confai mcp doctor` resolves each server's executable on `PATH`
+  and calls each remote endpoint, without launching anything. `mcp preset`
+  carries recipes for Continuum, Context7, Playwright, GitHub, Git, Fetch,
+  Filesystem, Memory and Sequential Thinking.
 - Interactive TUI, launched by running `confai` with no arguments: two panes of
   agents and endpoints, a `Ctrl+P` command palette, filtering, health checks,
   model selection and sync, preset application, and mouse support. Keys are

@@ -14,6 +14,7 @@ use super::json;
 use super::sidecar::{self, Sidecar};
 use super::{validate_provider_id, Agent, AgentConfig, AgentInfo, Capabilities};
 use crate::domain::Provider;
+use crate::mcp;
 
 const ENV_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 const ENV_AUTH_TOKEN: &str = "ANTHROPIC_AUTH_TOKEN";
@@ -40,6 +41,7 @@ impl Claude {
                     selectable_provider: true,
                     per_provider_models: false,
                     inline_api_key: true,
+                    mcp: true,
                 },
             },
         })
@@ -53,6 +55,11 @@ impl Agent for Claude {
 
     fn load(&self) -> Result<Box<dyn AgentConfig>> {
         let root = json::load(&self.info.config_path)?;
+        // MCP servers are not in settings.json but in ~/.claude.json, which also
+        // holds a great deal of live session state. It is only ever rewritten
+        // when an MCP edit actually changed something.
+        let state_path = state_path();
+        let state = json::load(&state_path).unwrap_or_else(|_| Value::Object(Default::default()));
         let mut roster = Sidecar::load(self.info.id)?;
 
         // Whatever `env` currently points at is a real endpoint the user is
@@ -61,7 +68,23 @@ impl Agent for Claude {
             roster.adopt(current);
         }
 
-        Ok(Box::new(ClaudeConfig { info: self.info.clone(), root, roster }))
+        Ok(Box::new(ClaudeConfig {
+            info: self.info.clone(),
+            root,
+            roster,
+            state,
+            state_path,
+            state_dirty: false,
+        }))
+    }
+}
+
+/// Where Claude Code keeps `~/.claude.json`, honouring the same override its
+/// settings file does.
+fn state_path() -> PathBuf {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir).join(".claude.json"),
+        None => dirs::home_dir().unwrap_or_default().join(".claude.json"),
     }
 }
 
@@ -69,6 +92,10 @@ pub struct ClaudeConfig {
     info: AgentInfo,
     root: Value,
     roster: Sidecar,
+    /// `~/.claude.json`, which is where the MCP servers live.
+    state: Value,
+    state_path: PathBuf,
+    state_dirty: bool,
 }
 
 impl ClaudeConfig {
@@ -156,12 +183,74 @@ impl AgentConfig for ClaudeConfig {
         Ok(())
     }
 
+    fn mcp_servers(&self) -> Vec<mcp::Server> {
+        json::object(&self.state, "mcpServers")
+            .map(|servers| servers.iter().map(|(name, entry)| read_mcp(name, entry)).collect())
+            .unwrap_or_default()
+    }
+
+    fn upsert_mcp(&mut self, server: &mcp::Server) -> Result<()> {
+        validate_provider_id(&server.name)?;
+
+        let servers = json::object_mut(&mut self.state, "mcpServers")?;
+        let entry =
+            servers.entry(server.name.clone()).or_insert_with(|| Value::Object(Default::default()));
+        let entry = entry
+            .as_object_mut()
+            .with_context(|| format!("`mcpServers.{}` is not a JSON object", server.name))?;
+
+        match &server.transport {
+            mcp::Transport::Stdio { command, args } => {
+                entry.insert("type".into(), Value::from("stdio"));
+                entry.insert("command".into(), Value::from(command.as_str()));
+                entry.insert(
+                    "args".into(),
+                    Value::Array(args.iter().map(|a| Value::from(a.as_str())).collect()),
+                );
+                entry.remove("url");
+            }
+            mcp::Transport::Remote { url } => {
+                entry.insert("type".into(), Value::from("http"));
+                entry.insert("url".into(), Value::from(url.as_str()));
+                entry.remove("command");
+                entry.remove("args");
+            }
+        }
+
+        if server.env.is_empty() {
+            entry.remove("env");
+        } else {
+            let env =
+                entry.entry("env".to_string()).or_insert_with(|| Value::Object(Default::default()));
+            if let Some(env) = env.as_object_mut() {
+                for (key, value) in &server.env {
+                    env.insert(key.clone(), Value::from(value.as_str()));
+                }
+            }
+        }
+
+        self.state_dirty = true;
+        Ok(())
+    }
+
+    fn remove_mcp(&mut self, name: &str) -> Result<bool> {
+        let removed = json::object_mut(&mut self.state, "mcpServers")?.remove(name).is_some();
+        self.state_dirty |= removed;
+        Ok(removed)
+    }
+
     fn render(&self) -> String {
         json::render(&self.root)
     }
 
     fn save(&self) -> Result<()> {
         self.roster.save()?;
+        // Claude Code writes ~/.claude.json continuously, so it is only touched
+        // when an MCP edit actually changed it. Rewriting it otherwise would
+        // race the agent for no reason.
+        if self.state_dirty {
+            json::write(&self.state_path, &self.state)?;
+        }
         json::write(self.path(), &self.root)
     }
 }
@@ -179,7 +268,14 @@ mod tests {
         if let Some(current) = endpoint_in_env(&root) {
             sidecar.adopt(current);
         }
-        ClaudeConfig { info: Claude::discover().unwrap().info, root, roster: sidecar }
+        ClaudeConfig {
+            info: Claude::discover().unwrap().info,
+            root,
+            roster: sidecar,
+            state: Value::Object(Default::default()),
+            state_path: std::env::temp_dir().join("confai-claude-state-test.json"),
+            state_dirty: false,
+        }
     }
 
     fn provider(id: &str, url: &str) -> Provider {
@@ -263,4 +359,30 @@ mod tests {
         assert_eq!(cfg.root["env"]["OTHER"], j!("keep"), "clobbered an unrelated variable");
         assert!(cfg.active_provider().is_none());
     }
+}
+
+/// Claude Code stores a stdio server as a command plus a separate `args` list,
+/// and has no flag to disable one without removing it.
+fn read_mcp(name: &str, entry: &Value) -> mcp::Server {
+    let transport = match entry.get("url").and_then(Value::as_str) {
+        Some(url) => mcp::Transport::Remote { url: url.to_string() },
+        None => mcp::Transport::Stdio {
+            command: entry.get("command").and_then(Value::as_str).unwrap_or_default().to_string(),
+            args: entry
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default(),
+        },
+    };
+
+    let env = entry
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()
+        })
+        .unwrap_or_default();
+
+    mcp::Server { name: name.to_string(), transport, env, enabled: None }
 }

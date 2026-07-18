@@ -1,0 +1,8 @@
+id = "playwright"
+name = "Playwright"
+description = "Drive a real browser: navigate, click, extract"
+homepage = "https://github.com/microsoft/playwright-mcp"
+
+[server]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]

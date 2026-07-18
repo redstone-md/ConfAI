@@ -11,6 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use super::{validate_provider_id, Agent, AgentConfig, AgentInfo, Capabilities};
 use crate::domain::{Provider, WireApi};
+use crate::mcp;
 use crate::store;
 
 /// Keys under `[model_providers.<id>]` that map onto [`Provider`] fields.
@@ -39,6 +40,7 @@ impl Codex {
                     selectable_provider: true,
                     per_provider_models: false,
                     inline_api_key: true,
+                    mcp: true,
                 },
             },
         })
@@ -173,9 +175,106 @@ impl AgentConfig for CodexConfig {
         Ok(())
     }
 
+    fn mcp_servers(&self) -> Vec<mcp::Server> {
+        let Some(table) = self.doc.get("mcp_servers").and_then(Item::as_table) else {
+            return Vec::new();
+        };
+        table.iter().filter_map(|(name, item)| item.as_table().map(|t| read_mcp(name, t))).collect()
+    }
+
+    fn upsert_mcp(&mut self, server: &mcp::Server) -> Result<()> {
+        validate_provider_id(&server.name)?;
+
+        let item = self.doc.entry("mcp_servers").or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        });
+        let entry = item
+            .as_table_mut()
+            .context("`mcp_servers` is not a table")?
+            .entry(&server.name)
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .with_context(|| format!("`mcp_servers.{}` is not a table", server.name))?;
+
+        match &server.transport {
+            mcp::Transport::Stdio { command, args } => {
+                entry["command"] = toml_edit::value(command.as_str());
+                entry.remove("url");
+                let mut list = toml_edit::Array::new();
+                for arg in args {
+                    list.push(arg.as_str());
+                }
+                if list.is_empty() {
+                    entry.remove("args");
+                } else {
+                    entry["args"] = toml_edit::value(list);
+                }
+            }
+            mcp::Transport::Remote { url } => {
+                entry["url"] = toml_edit::value(url.as_str());
+                entry.remove("command");
+                entry.remove("args");
+            }
+        }
+
+        if server.env.is_empty() {
+            entry.remove("env");
+        } else {
+            let env = entry
+                .entry("env")
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .with_context(|| format!("`mcp_servers.{}.env` is not a table", server.name))?;
+            for (key, value) in &server.env {
+                env[key.as_str()] = toml_edit::value(value.as_str());
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_mcp(&mut self, name: &str) -> Result<bool> {
+        let Some(table) = self.doc.get_mut("mcp_servers").and_then(Item::as_table_mut) else {
+            return Ok(false);
+        };
+        Ok(table.remove(name).is_some())
+    }
+
     fn render(&self) -> String {
         self.doc.to_string()
     }
+}
+
+/// Codex keys a server's environment under `env`, and has no enabled flag: a
+/// server is configured or it is not.
+fn read_mcp(name: &str, table: &Table) -> mcp::Server {
+    let string_at = |key: &str| table.get(key).and_then(Item::as_str).map(str::to_owned);
+
+    let transport = match (string_at("command"), string_at("url")) {
+        (_, Some(url)) => mcp::Transport::Remote { url },
+        (Some(command), None) => mcp::Transport::Stdio {
+            command,
+            args: table
+                .get("args")
+                .and_then(Item::as_array)
+                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default(),
+        },
+        (None, None) => mcp::Transport::Stdio { command: String::new(), args: Vec::new() },
+    };
+
+    let env = table
+        .get("env")
+        .and_then(Item::as_table)
+        .map(|env| {
+            env.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.to_string(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    mcp::Server { name: name.to_string(), transport, env, enabled: None }
 }
 
 /// Write `value`, or drop the key entirely when there is nothing to write.

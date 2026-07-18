@@ -19,6 +19,7 @@ use self::auth::AuthStore;
 use super::json;
 use super::{validate_provider_id, Agent, AgentConfig, AgentInfo, Capabilities};
 use crate::domain::{Model, Provider, WireApi};
+use crate::mcp;
 
 /// The `npm` adapter opencode loads for each wire protocol.
 /// Synthetic extra naming how a provider authenticates. It is reported, never
@@ -52,6 +53,7 @@ impl OpenCode {
                     selectable_provider: true,
                     per_provider_models: true,
                     inline_api_key: true,
+                    mcp: true,
                 },
             },
         })
@@ -332,6 +334,69 @@ impl AgentConfig for OpenCodeConfig {
         Ok(())
     }
 
+    fn mcp_servers(&self) -> Vec<mcp::Server> {
+        json::object(&self.root, "mcp")
+            .map(|servers| servers.iter().map(|(name, entry)| read_mcp(name, entry)).collect())
+            .unwrap_or_default()
+    }
+
+    fn upsert_mcp(&mut self, server: &mcp::Server) -> Result<()> {
+        validate_provider_id(&server.name)?;
+
+        let servers = json::object_mut(&mut self.root, "mcp")?;
+        let entry = servers.entry(server.name.clone()).or_insert_with(|| Value::Object(Map::new()));
+        let entry = entry
+            .as_object_mut()
+            .with_context(|| format!("`mcp.{}` is not a JSON object", server.name))?;
+
+        match &server.transport {
+            // opencode takes the program and its arguments as one list, not as a
+            // command plus args the way the other two do.
+            mcp::Transport::Stdio { command, args } => {
+                let mut line = vec![json!(command)];
+                line.extend(args.iter().map(|arg| json!(arg)));
+                entry.insert("type".into(), json!("local"));
+                entry.insert("command".into(), Value::Array(line));
+                entry.remove("url");
+            }
+            mcp::Transport::Remote { url } => {
+                entry.insert("type".into(), json!("remote"));
+                entry.insert("url".into(), json!(url));
+                entry.remove("command");
+            }
+        }
+
+        // Spelled `environment` here, `env` in the other two.
+        if server.env.is_empty() {
+            entry.remove("environment");
+        } else {
+            let env =
+                entry.entry("environment".to_string()).or_insert_with(|| Value::Object(Map::new()));
+            if let Some(env) = env.as_object_mut() {
+                for (key, value) in &server.env {
+                    env.insert(key.clone(), json!(value));
+                }
+            }
+        }
+
+        entry.insert("enabled".into(), json!(server.is_enabled()));
+        Ok(())
+    }
+
+    fn remove_mcp(&mut self, name: &str) -> Result<bool> {
+        Ok(json::object_mut(&mut self.root, "mcp")?.remove(name).is_some())
+    }
+
+    fn set_mcp_enabled(&mut self, name: &str, enabled: bool) -> Result<()> {
+        let servers = json::object_mut(&mut self.root, "mcp")?;
+        let entry = servers
+            .get_mut(name)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("opencode has no MCP server {name:?}"))?;
+        entry.insert("enabled".into(), json!(enabled));
+        Ok(())
+    }
+
     fn set_model_for(&mut self, provider_id: &str, model: &str) -> Result<()> {
         let qualified =
             if model.contains('/') { model.to_string() } else { format!("{provider_id}/{model}") };
@@ -347,6 +412,38 @@ impl AgentConfig for OpenCodeConfig {
         // is a clearer state to recover from than a key with no provider.
         self.auth.save()?;
         json::write(self.path(), &self.root)
+    }
+}
+
+/// opencode's `command` is the whole command line in one list; the first element
+/// is the program.
+fn read_mcp(name: &str, entry: &Value) -> mcp::Server {
+    let transport = match entry.get("url").and_then(Value::as_str) {
+        Some(url) => mcp::Transport::Remote { url: url.to_string() },
+        None => {
+            let mut line = entry
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+                .unwrap_or_else(Vec::new)
+                .into_iter();
+            mcp::Transport::Stdio { command: line.next().unwrap_or_default(), args: line.collect() }
+        }
+    };
+
+    let env = entry
+        .get("environment")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()
+        })
+        .unwrap_or_default();
+
+    mcp::Server {
+        name: name.to_string(),
+        transport,
+        env,
+        enabled: entry.get("enabled").and_then(Value::as_bool),
     }
 }
 

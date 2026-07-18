@@ -1,0 +1,8 @@
+id = "github"
+name = "GitHub"
+description = "Issues, pull requests and code search on GitHub"
+homepage = "https://github.com/github/github-mcp-server"
+
+[server]
+command = "npx"
+args = ["-y", "@github/github-mcp-server"]

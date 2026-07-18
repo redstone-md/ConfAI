@@ -8,7 +8,7 @@ Five ways in, in rough order of how much you have to think about them. Pick one.
 | Prebuilt, scripted (Windows) | `irm .../install.ps1 \| iex` | PowerShell 5.1+ |
 | Prebuilt, no script | Download an archive from the releases page | nothing |
 | Prebuilt, via cargo | `cargo binstall confai` | `cargo-binstall` |
-| From source | `cargo install confai` | Rust 1.82+ |
+| From source | `cargo install confai` | Rust 1.88+ |
 
 ---
 
@@ -22,7 +22,7 @@ cargo install confai
 ```
 
 This needs a Rust toolchain at or above the `rust-version` in `Cargo.toml`
-(1.82 at the time of writing) and takes a few minutes, since the release
+(1.88 at the time of writing) and takes a few minutes, since the release
 profile uses fat LTO. The binary lands in `~/.cargo/bin`, which cargo already
 puts on your PATH.
 

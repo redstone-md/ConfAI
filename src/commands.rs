@@ -6,8 +6,11 @@ use anyhow::{bail, Context, Result};
 
 use crate::agent::{self, Agent, AgentConfig};
 use crate::brand;
-use crate::cli::{Command, PresetCommand, ProviderCommand, ProviderFields, Target};
+use crate::cli::{
+    Command, McpCommand, McpPresetCommand, PresetCommand, ProviderCommand, ProviderFields, Target,
+};
 use crate::domain::{mask, Provider, WireApi};
+use crate::mcp;
 use crate::net;
 use crate::preset;
 use crate::store;
@@ -18,6 +21,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::List => list_agents(),
         Command::Provider(cmd) => provider(cmd),
         Command::Preset(cmd) => preset_command(cmd),
+        Command::Mcp(cmd) => mcp_command(cmd),
         Command::Model { model, target } => model_command(model, &target),
         Command::Path { target } => paths(&target),
         Command::Edit { target } => edit(&target),
@@ -531,6 +535,279 @@ fn sync_into(
 
     let pruned = if prune { config.prune_models(id, &served)? } else { 0 };
     Ok(SyncOutcome { written, pruned })
+}
+
+fn mcp_command(command: McpCommand) -> Result<()> {
+    match command {
+        McpCommand::List { target } => mcp_list(&target),
+        McpCommand::Doctor { target, timeout } => mcp_doctor(&target, Duration::from_secs(timeout)),
+        McpCommand::Add { name, target, command, args, url, env } => {
+            mcp_add(&name, &target, command.as_deref(), &args, url.as_deref(), &env)
+        }
+        McpCommand::Remove { name, target } => mcp_remove(&name, &target),
+        McpCommand::Toggle { name, off, target } => mcp_toggle(&name, !off, &target),
+        McpCommand::Preset(McpPresetCommand::List) => mcp_preset_list(),
+        McpCommand::Preset(McpPresetCommand::Apply { id, target, name }) => {
+            mcp_preset_apply(&id, &target, name.as_deref())
+        }
+    }
+}
+
+/// The agents a MCP command applies to, skipping any that cannot express one.
+fn mcp_agents(target: &Target) -> Result<Vec<Box<dyn Agent>>> {
+    let agents: Vec<Box<dyn Agent>> =
+        resolve(target)?.into_iter().filter(|a| a.info().capabilities.mcp).collect();
+    if agents.is_empty() {
+        bail!("no selected agent stores MCP servers");
+    }
+    Ok(agents)
+}
+
+fn mcp_list(target: &Target) -> Result<()> {
+    let mut table = Table::new(["agent", "server", "kind", "on", "command or url"]);
+
+    for entry in mcp_agents(target)? {
+        let config = match entry.load() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("{}: {err:#}", ui::yellow(entry.info().name));
+                continue;
+            }
+        };
+        for server in config.mcp_servers() {
+            table.row([
+                entry.info().id.to_string(),
+                server.name.clone(),
+                server.transport.kind().to_string(),
+                match server.enabled {
+                    Some(true) | None => ui::green("yes"),
+                    Some(false) => ui::dim("no"),
+                },
+                ui::truncate(&server.transport.summary(), 54),
+            ]);
+        }
+    }
+
+    if table.is_empty() {
+        println!("{}", ui::dim("no MCP servers configured"));
+        return Ok(());
+    }
+    print!("{}", table.render());
+    Ok(())
+}
+
+fn mcp_doctor(target: &Target, timeout: Duration) -> Result<()> {
+    let mut broken = 0;
+    let mut checked = 0;
+
+    for entry in mcp_agents(target)? {
+        let config = entry.load()?;
+        let servers = config.mcp_servers();
+        if servers.is_empty() {
+            println!("{} {}: no MCP servers", ui::dim("·"), entry.info().name);
+            continue;
+        }
+
+        println!("{}", ui::bold(entry.info().name));
+        for server in servers {
+            let health = mcp::check(&server, timeout);
+            checked += 1;
+            let icon = match &health {
+                mcp::Health::Ok(_) => ui::green("✓"),
+                mcp::Health::Broken(_) => {
+                    broken += 1;
+                    ui::red("✗")
+                }
+                mcp::Health::Skipped(_) => ui::dim("·"),
+            };
+            println!(
+                "  {icon} {:<22} {}",
+                server.name,
+                match &health {
+                    mcp::Health::Ok(m) => ui::dim(m),
+                    mcp::Health::Broken(m) => ui::red(m),
+                    mcp::Health::Skipped(m) => ui::dim(m),
+                }
+            );
+        }
+    }
+
+    if checked == 0 {
+        return Ok(());
+    }
+    if broken == 0 {
+        println!("\n{}", ui::green("every MCP server resolves"));
+        return Ok(());
+    }
+    bail!("{broken} MCP server(s) could not be resolved")
+}
+
+/// Build a server from command-line fields, overlaying an existing one so a
+/// partial edit does not clear what it did not mention.
+fn mcp_server_from_fields(
+    existing: Option<mcp::Server>,
+    name: &str,
+    command: Option<&str>,
+    args: &[String],
+    url: Option<&str>,
+    env: &[String],
+) -> Result<mcp::Server> {
+    let transport = match (command, url) {
+        (_, Some(url)) => mcp::Transport::Remote { url: url.to_string() },
+        (Some(command), None) => {
+            mcp::Transport::Stdio { command: command.to_string(), args: args.to_vec() }
+        }
+        (None, None) => match existing.as_ref().map(|s| s.transport.clone()) {
+            Some(transport) => transport,
+            None => bail!("give either --command or --url for a new server"),
+        },
+    };
+
+    let mut server = mcp::Server {
+        name: name.to_string(),
+        transport,
+        env: existing.map(|s| s.env).unwrap_or_default(),
+        enabled: None,
+    };
+    for raw in env {
+        let (key, value) =
+            raw.split_once('=').with_context(|| format!("--env expects KEY=VALUE, got {raw:?}"))?;
+        server.env.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    Ok(server)
+}
+
+fn mcp_add(
+    name: &str,
+    target: &Target,
+    command: Option<&str>,
+    args: &[String],
+    url: Option<&str>,
+    env: &[String],
+) -> Result<()> {
+    let agents = if target.all { mcp_agents(target)? } else { vec![resolve_one(target)?] };
+
+    for entry in agents {
+        if !entry.info().capabilities.mcp {
+            bail!("{} does not store MCP servers", entry.info().name);
+        }
+        let mut config = entry.load()?;
+        let existed = config.mcp_server(name).is_some();
+        let server =
+            mcp_server_from_fields(config.mcp_server(name), name, command, args, url, env)?;
+
+        config.upsert_mcp(&server)?;
+        config.save()?;
+        println!(
+            "{} {} {} in {}",
+            ui::green("✓"),
+            if existed { "updated" } else { "added" },
+            ui::bold(name),
+            entry.info().name
+        );
+    }
+    Ok(())
+}
+
+fn mcp_remove(name: &str, target: &Target) -> Result<()> {
+    let agents = if target.all { mcp_agents(target)? } else { vec![resolve_one(target)?] };
+    let mut removed_anywhere = false;
+
+    for entry in agents {
+        let mut config = entry.load()?;
+        if !config.remove_mcp(name)? {
+            continue;
+        }
+        config.save()?;
+        removed_anywhere = true;
+        println!("{} removed {} from {}", ui::green("✓"), ui::bold(name), entry.info().name);
+    }
+
+    if !removed_anywhere {
+        bail!("no selected agent has an MCP server called {name:?}");
+    }
+    Ok(())
+}
+
+fn mcp_toggle(name: &str, enabled: bool, target: &Target) -> Result<()> {
+    let agents = if target.all { mcp_agents(target)? } else { vec![resolve_one(target)?] };
+    let mut changed = false;
+
+    for entry in agents {
+        let mut config = entry.load()?;
+        if config.mcp_server(name).is_none() {
+            continue;
+        }
+        match config.set_mcp_enabled(name, enabled) {
+            Ok(()) => {
+                config.save()?;
+                changed = true;
+                println!(
+                    "{} {} {} in {}",
+                    ui::green("✓"),
+                    if enabled { "enabled" } else { "disabled" },
+                    ui::bold(name),
+                    entry.info().name
+                );
+            }
+            // Codex and Claude Code have no such flag; say so rather than
+            // pretending the server was turned off.
+            Err(err) => eprintln!("{} {err:#}", ui::yellow("!")),
+        }
+    }
+
+    if !changed {
+        bail!("no selected agent could toggle an MCP server called {name:?}");
+    }
+    Ok(())
+}
+
+fn mcp_preset_list() -> Result<()> {
+    let presets = preset::mcp_all()?;
+    let mut table = Table::new(["preset", "name", "command or url", "source", "description"]);
+
+    for entry in &presets {
+        let server = entry.server(None)?;
+        table.row([
+            ui::bold(&entry.id),
+            entry.name.clone(),
+            ui::truncate(&server.transport.summary(), 40),
+            ui::dim(entry.origin.as_str()),
+            ui::truncate(&entry.description, 44),
+        ]);
+    }
+
+    print!("{}", table.render());
+    if let Some(dir) = preset::mcp_user_dir() {
+        println!("\n{}", ui::dim(&format!("drop your own in {}", dir.display())));
+    }
+    Ok(())
+}
+
+fn mcp_preset_apply(id: &str, target: &Target, name: Option<&str>) -> Result<()> {
+    let entry = preset::mcp_find(id)?;
+    let server = entry.server(name)?;
+
+    for var in entry.missing_env() {
+        eprintln!(
+            "{} {} expects ${var} to be set; it is not, so the server will start but may not work",
+            ui::yellow("!"),
+            entry.name
+        );
+    }
+
+    for agent_entry in mcp_agents(target)? {
+        let mut config = agent_entry.load()?;
+        config.upsert_mcp(&server)?;
+        config.save()?;
+        println!(
+            "{} added {} to {}",
+            ui::green("✓"),
+            ui::bold(&server.name),
+            agent_entry.info().name
+        );
+    }
+    Ok(())
 }
 
 fn preset_command(command: PresetCommand) -> Result<()> {
