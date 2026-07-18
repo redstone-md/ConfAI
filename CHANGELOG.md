@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/redstone-md/ConfAI/releases/tag/v0.0.2) - 2026-07-18
+
+### Features
+
+- Manage the MCP servers an agent launches ([`ab1e0a5`](https://github.com/redstone-md/ConfAI/commit/ab1e0a53bff2a9dfb2cbe5175155f7acb58c04d2))
+
+### Fixes
+
+- Satisfy the lint gate CI actually enforces ([`f6590a6`](https://github.com/redstone-md/ConfAI/commit/f6590a68550f39e69f4e78b48c26296c0a085919))
+
+Full changelog: [v0.0.1...v0.0.2](https://github.com/redstone-md/ConfAI/compare/v0.0.1...v0.0.2)
+
+
+
 ## [0.0.1] - 2026-07-18
 
 First tagged build. Everything below works and is covered by tests, but the
