@@ -210,13 +210,20 @@ impl AgentConfig for OpenCodeConfig {
 
         json::set_or_clear(entry, "name", merged.display_name.clone().map(Value::from));
 
-        // opencode picks its SDK adapter from `npm`; an explicit extra wins over
-        // the one inferred from the wire protocol.
-        let npm = merged
+        // opencode picks its SDK adapter from `npm`, so changing the wire
+        // protocol has to change `npm` or nothing happens.
+        //
+        // The npm to prefer is the one the caller passed, not the one already in
+        // the file. `read_provider` puts the existing `npm` into `extras`, and
+        // merging carries it forward, so consulting the merged value meant a
+        // stale adapter outvoting the new wire protocol and the change silently
+        // doing nothing.
+        let npm = provider
             .extras
             .get("npm")
             .cloned()
-            .or_else(|| merged.wire_api.map(|w| wire_to_npm(w).to_string()));
+            .or_else(|| merged.wire_api.map(|w| wire_to_npm(w).to_string()))
+            .or_else(|| merged.extras.get("npm").cloned());
         json::set_or_clear(entry, "npm", npm.map(Value::from));
 
         if merged.base_url.is_some() || inline_key.is_some() {
@@ -608,6 +615,45 @@ mod tests {
 
         assert_eq!(cfg.root["provider"]["byesu"]["npm"], json!(NPM_ANTHROPIC));
         assert_eq!(cfg.provider("byesu").unwrap().wire_api, Some(WireApi::Anthropic));
+    }
+
+    #[test]
+    fn changing_the_wire_protocol_changes_the_adapter() {
+        // The reported bug: switching an existing provider to `responses` looked
+        // like it worked and then read back as `chat`, because the npm already in
+        // the file was carried through the merge and outvoted the new wire.
+        let mut cfg = config(SAMPLE);
+        assert_eq!(cfg.provider("vendor").unwrap().wire_api, Some(WireApi::Chat));
+
+        let mut patch = Provider::new("vendor");
+        patch.wire_api = Some(WireApi::Responses);
+        cfg.upsert_provider(&patch).unwrap();
+
+        assert_eq!(cfg.root["provider"]["vendor"]["npm"], json!(NPM_RESPONSES));
+        assert_eq!(cfg.provider("vendor").unwrap().wire_api, Some(WireApi::Responses));
+    }
+
+    #[test]
+    fn an_npm_passed_by_the_caller_still_beats_the_wire_protocol() {
+        // Someone naming an adapter explicitly means it, even one ConfAI cannot
+        // map back to a wire protocol.
+        let mut cfg = config(SAMPLE);
+        let mut patch = Provider::new("vendor");
+        patch.wire_api = Some(WireApi::Responses);
+        patch.extras.insert("npm".into(), "@scope/custom-adapter".into());
+        cfg.upsert_provider(&patch).unwrap();
+
+        assert_eq!(cfg.root["provider"]["vendor"]["npm"], json!("@scope/custom-adapter"));
+    }
+
+    #[test]
+    fn an_edit_that_says_nothing_about_the_wire_keeps_the_adapter() {
+        let mut cfg = config(SAMPLE);
+        let mut patch = Provider::new("vendor");
+        patch.base_url = Some("https://moved.example/v1".into());
+        cfg.upsert_provider(&patch).unwrap();
+
+        assert_eq!(cfg.root["provider"]["vendor"]["npm"], json!(NPM_CHAT));
     }
 
     #[test]
