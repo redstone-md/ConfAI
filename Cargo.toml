@@ -1,6 +1,6 @@
 [package]
 name = "confai"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 # Set by ratatui, which declares 1.88.0; the rest of the tree needs 1.85 at most.
 rust-version = "1.88"
