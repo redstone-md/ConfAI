@@ -284,8 +284,14 @@ El resto actúan sobre lo que el panel derecho esté mostrando:
 | `e` | editar | editar | — |
 | `d` | eliminar | eliminar | eliminar, tras confirmar |
 | `c` / `C` | comprobar · comprobar todos | comprobar · comprobar todos | — |
-| `p` | aplicar un preset | añadir un servidor ya preparado | — |
+| `p` | aplicar un preset | buscar un servidor MCP | — |
+| `g` | buscar un servidor MCP | buscar un servidor MCP | buscar un servidor MCP |
 | `y` | — | — | copiar a otro agente |
+
+**`p` y `g` abren el mismo panel.** Busca en las dos fuentes a la vez: primero
+las nueve recetas integradas, marcadas con estrella como recomendadas, y después
+el registro oficial. Escribir filtra lo ya listado; `Ctrl+R` consulta el
+registro, la única tecla que llega a la red.
 
 **Para las skills no hay añadir ni editar.** Una skill no se escribe en una vista
 de lista; para eso está un editor de texto. Esas teclas simplemente no hacen nada

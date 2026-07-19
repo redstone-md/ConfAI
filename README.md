@@ -277,8 +277,14 @@ The rest act on whatever the right pane is showing:
 | `e` | edit | edit | — |
 | `d` | delete | delete | delete, behind a confirm |
 | `c` / `C` | check · check all | check · check all | — |
-| `p` | apply a preset | add a ready-made server | — |
+| `p` | apply a preset | find an MCP server | — |
+| `g` | find an MCP server | find an MCP server | find an MCP server |
 | `y` | — | — | copy into another agent |
+
+**`p` and `g` open the same panel.** It searches both places a server can come
+from at once: the nine built-in recipes first, starred as recommended, then
+whatever the official registry has. Typing filters what is already listed;
+`Ctrl+R` asks the registry, which is the only key that reaches the network.
 
 **There is no add or edit for skills.** You do not write a skill in a list view;
 that is what a text editor is for. Those keys do nothing in the skills lens

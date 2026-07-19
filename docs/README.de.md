@@ -291,8 +291,14 @@ Der Rest wirkt auf das, was die rechte Spalte gerade zeigt:
 | `e` | bearbeiten | bearbeiten | — |
 | `d` | löschen | löschen | löschen, nach Rückfrage |
 | `c` / `C` | prüfen · alle prüfen | prüfen · alle prüfen | — |
-| `p` | ein Preset anwenden | einen fertigen Server hinzufügen | — |
+| `p` | ein Preset anwenden | einen MCP-Server finden | — |
+| `g` | einen MCP-Server finden | einen MCP-Server finden | einen MCP-Server finden |
 | `y` | — | — | in einen anderen Agenten kopieren |
+
+**`p` und `g` öffnen dasselbe Panel.** Es durchsucht beide Quellen auf einmal:
+zuerst die neun eingebauten Rezepte, mit Stern als empfohlen markiert, danach
+das offizielle Registry. Tippen filtert das bereits Gelistete; `Strg+R` fragt
+das Registry — die einzige Taste, die ins Netz geht.
 
 **Für Skills gibt es kein Hinzufügen und kein Bearbeiten.** Einen Skill schreibt
 man nicht in einer Listenansicht; dafür ist ein Texteditor da. Diese Tasten tun
