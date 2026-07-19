@@ -1,3 +1,6 @@
 /target
 **/*.confai.bak
 **/*.confai.tmp.*
+
+# Worktrees this session creates for isolated agent work.
+.claude/worktrees/
