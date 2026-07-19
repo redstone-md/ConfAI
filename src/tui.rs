@@ -34,9 +34,10 @@ use crate::agent::{self, Agent, AgentConfig, Capabilities, Detection};
 use crate::brand::{self, palette};
 use crate::domain::{mask, Model, Provider, WireApi};
 use crate::mcp;
-use crate::net::{self, catalog};
+use crate::net::{self, catalog, registry};
 use crate::preset::{self, Preset};
 use crate::skill::{self, Skill};
+use crate::store;
 use crate::ui;
 
 pub fn run() -> Result<()> {
@@ -89,6 +90,9 @@ const DOT_HOLLOW: &str = "○";
 const DOT_HALF: &str = "◐";
 /// The nothing-recorded placeholder, distinct from a literal empty string.
 const ABSENT: &str = "—";
+/// Between the lens tabs in a pane title. A rule rather than the `·` the rest of
+/// the title joins with, so a tab boundary is not read as part of a name.
+const TAB_SEPARATOR: &str = " │ ";
 
 /// Below this many rows the header collapses to one line.
 const COMPACT_HEIGHT: u16 = 30;
@@ -96,6 +100,11 @@ const COMPACT_HEIGHT: u16 = 30;
 const TAGLINE_WIDTH: u16 = 100;
 /// The agent pane never grows; the provider pane is the one with columns to fill.
 const AGENT_PANE_WIDTH: u16 = 30;
+
+/// How many registry records to ask for before de-duplication, matching
+/// `confai mcp search --limit`. The registry publishes one record per published
+/// version, so this is a good deal fewer than fifty distinct servers.
+const REGISTRY_LIMIT: usize = 50;
 
 /// Keys that only move the cursor, so they dispatch no action and appear in the
 /// help screen by hand.
@@ -216,6 +225,8 @@ impl Pane {
 enum Tone {
     Info,
     Good,
+    /// Works, but wants attention: the report equivalent of the CLI's yellow `!`.
+    Warn,
     Bad,
 }
 
@@ -224,6 +235,7 @@ impl Tone {
         Style::default().fg(match self {
             Tone::Info => palette::MUTED,
             Tone::Good => palette::GOOD,
+            Tone::Warn => palette::WARN,
             Tone::Bad => palette::BAD,
         })
     }
@@ -232,6 +244,7 @@ impl Tone {
         match self {
             Tone::Info => "·",
             Tone::Good => "✓",
+            Tone::Warn => "!",
             Tone::Bad => "✗",
         }
     }
@@ -338,6 +351,43 @@ fn next_lens(from: Lens, mcp: bool, skills: bool) -> Lens {
         .map(|step| LENSES[(at + step) % LENSES.len()])
         .find(|lens| lens_supported(*lens, mcp, skills))
         .unwrap_or(Lens::Providers)
+}
+
+/// How many rows a lens would show for this agent, before any filter. This is
+/// what a tab counts: the point of the tabs is to see that an agent runs three
+/// MCP servers without having to switch to look.
+fn lens_total(agent: &AgentEntry, lens: Lens) -> usize {
+    match lens {
+        Lens::Providers => agent.providers.len(),
+        Lens::Mcp => agent.mcp.len(),
+        Lens::Skills => agent.skills.len(),
+    }
+}
+
+/// One tab per lens this agent actually has, or `None` when it has only the one
+/// and there is nothing to offer a choice between.
+///
+/// A lens the agent has no facility for is left out rather than greyed: a tab
+/// that cannot be selected is a dead target, and the cycle skips it too.
+fn lens_tabs(agent: &AgentEntry, active: Lens) -> Option<PaneTitle> {
+    let offered: Vec<Lens> = LENSES
+        .into_iter()
+        .filter(|lens| lens_supported(*lens, agent.capabilities.mcp, agent.skills_dir.is_some()))
+        .collect();
+    if offered.len() < 2 {
+        return None;
+    }
+
+    let mut title = PaneTitle::plain(format!("{} ·", agent.name));
+    for (index, lens) in offered.into_iter().enumerate() {
+        title.push(TitleRole::Separator, if index == 0 { " " } else { TAB_SEPARATOR }, None);
+        title.push(
+            if lens == active { TitleRole::Active } else { TitleRole::Inactive },
+            format!("{} {}", lens.label(), lens_total(agent, lens)),
+            Some(lens),
+        );
+    }
+    Some(title)
 }
 
 /// A case-insensitive substring filter over the provider list.
@@ -502,11 +552,21 @@ enum Action {
     McpToggle,
     /// Apply a named MCP preset, or `None` to open the picker.
     McpPreset(Option<String>),
+    /// Search the official MCP registry and install from it.
+    Registry,
     SkillDetail,
     SkillDelete,
     /// Copy the selected skill into another agent's skills directory.
     SkillCopy,
     Reload,
+    /// Check every config, provider and selection, and report what is wrong.
+    Doctor,
+    /// Ask now whether a newer release exists.
+    Update,
+    /// Put back the config as it was before this program last wrote to it.
+    Undo,
+    /// Open the selected agent's config file in `$EDITOR`.
+    EditConfig,
     Palette,
     Help,
     Quit,
@@ -529,6 +589,10 @@ fn menu() -> Vec<Action> {
         Action::Preset(None),
         Action::Lens(None),
         Action::Reload,
+        Action::EditConfig,
+        Action::Doctor,
+        Action::Update,
+        Action::Undo,
         Action::Palette,
         Action::Help,
         Action::Quit,
@@ -549,6 +613,7 @@ fn mcp_menu() -> Vec<Action> {
         Action::McpCheck,
         Action::McpCheckAll,
         Action::McpPreset(None),
+        Action::Registry,
     ]
 }
 
@@ -589,10 +654,15 @@ impl Action {
             Action::McpToggle => "enable or disable mcp server".into(),
             Action::McpPreset(Some(id)) => format!("mcp preset {id}"),
             Action::McpPreset(None) => "apply an mcp preset".into(),
+            Action::Registry => "search the mcp registry".into(),
             Action::SkillDetail => "skill detail".into(),
             Action::SkillDelete => "delete skill".into(),
             Action::SkillCopy => "copy skill to another agent".into(),
             Action::Reload => "reload from disk".into(),
+            Action::Doctor => "doctor".into(),
+            Action::Update => "check for updates".into(),
+            Action::Undo => "undo the last change".into(),
+            Action::EditConfig => "edit config in $EDITOR".into(),
             Action::Palette => "command palette".into(),
             Action::Help => "help".into(),
             Action::Quit => "quit".into(),
@@ -624,10 +694,15 @@ impl Action {
             Action::McpCheckAll => "check all",
             Action::McpToggle => "on/off",
             Action::McpPreset(_) => "preset",
+            Action::Registry => "registry",
             Action::SkillDetail => "detail",
             Action::SkillDelete => "del",
             Action::SkillCopy => "copy",
             Action::Reload => "reload",
+            Action::Doctor => "doctor",
+            Action::Update => "update",
+            Action::Undo => "undo",
+            Action::EditConfig => "editor",
             Action::Palette => "commands",
             Action::Help => "help",
             Action::Quit => "quit",
@@ -667,12 +742,23 @@ impl Action {
             Action::McpToggle => "turn this mcp server on or off without deleting it".into(),
             Action::McpPreset(Some(_)) => "add this ready-made mcp server to the agent".into(),
             Action::McpPreset(None) => "choose a ready-made mcp server to add".into(),
+            Action::Registry => {
+                "search the official registry of MCP servers and install one".into()
+            }
             Action::SkillDetail => "show the description, tools and any problem in full".into(),
             Action::SkillDelete => {
                 "delete this skill's directory, which undo cannot restore".into()
             }
             Action::SkillCopy => "copy this skill into another agent's skills directory".into(),
             Action::Reload => "re-read every config from disk".into(),
+            Action::Doctor => "check every config parses and every selected provider exists".into(),
+            Action::Update => "ask whether a newer release of this program exists".into(),
+            Action::Undo => {
+                "restore this agent's config from the backup taken before the last write".into()
+            }
+            Action::EditConfig => {
+                "open this agent's config file in $EDITOR and re-read it afterwards".into()
+            }
             Action::Palette => "search every action by name".into(),
             Action::Help => "the about screen and the full key map".into(),
             Action::Quit => format!("leave {}", brand::NAME),
@@ -705,10 +791,18 @@ impl Action {
             Action::McpCheckAll => "C",
             Action::McpToggle => "u",
             Action::McpPreset(_) => "p",
+            Action::Registry => "g",
             Action::SkillDetail => "enter",
             Action::SkillDelete => "d",
             Action::SkillCopy => "y",
             Action::Reload => "r",
+            Action::Doctor => "D",
+            // No key: it reaches the network for something the start-up notice
+            // already reports, so it belongs in the palette rather than under a
+            // finger beside the keys that edit a config.
+            Action::Update => return None,
+            Action::Undo => "U",
+            Action::EditConfig => "E",
             Action::Palette => "ctrl+p or ctrl+k",
             Action::Help => "?",
             Action::Quit => "q",
@@ -748,9 +842,21 @@ impl Action {
         };
 
         match self {
-            Action::Quit | Action::Help | Action::Reload | Action::Palette | Action::Filter => None,
+            // Whole-program checks; they need no agent and never fail to have
+            // something to say.
+            Action::Quit
+            | Action::Help
+            | Action::Reload
+            | Action::Palette
+            | Action::Filter
+            | Action::Doctor
+            | Action::Update => None,
             Action::SelectAgent(_) => None,
-            Action::Add | Action::Preset(_) | Action::Use(Some(_)) => no_agent(),
+            Action::Add
+            | Action::Preset(_)
+            | Action::Use(Some(_))
+            | Action::Undo
+            | Action::EditConfig => no_agent(),
             // Enter on the agent pane only moves the focus, so it is always fine.
             Action::Detail if app.focus == Pane::Agents => None,
             // Deliberately not gated on `per_provider_models`: that flag means
@@ -777,7 +883,7 @@ impl Action {
             Action::Lens(Some(Lens::Providers)) => None,
             Action::Lens(Some(Lens::Mcp)) => no_mcp(),
             Action::Lens(Some(Lens::Skills)) => no_skills(),
-            Action::McpAdd | Action::McpPreset(_) => no_mcp(),
+            Action::McpAdd | Action::McpPreset(_) | Action::Registry => no_mcp(),
             Action::McpDetail
             | Action::McpEdit
             | Action::McpDelete
@@ -842,6 +948,9 @@ impl Action {
             Action::McpToggle => app.toggle_mcp(),
             Action::McpPreset(Some(id)) => app.apply_mcp_preset_by_id(&id),
             Action::McpPreset(None) => app.open_mcp_presets(),
+            Action::Registry => {
+                app.schedule(Job::Registry(String::new()), "searching the MCP registry...")
+            }
 
             Action::SkillDetail => app.open_skill_detail(),
             Action::SkillDelete => app.ask_delete_skill(),
@@ -851,6 +960,10 @@ impl Action {
                 app.reload();
                 app.say(Tone::Info, "reloaded from disk");
             }
+            Action::Doctor => app.open_doctor(),
+            Action::Update => app.schedule(Job::Update, "asking about the latest release…"),
+            Action::Undo => app.ask_undo(),
+            Action::EditConfig => app.schedule(Job::EditConfig, "handing the config to $EDITOR…"),
             Action::Palette => app.open_palette(),
             Action::Help => app.overlay = Some(Overlay::About { scroll: 0 }),
             Action::Quit => app.quit = true,
@@ -1212,6 +1325,8 @@ enum Pending {
     OverwriteSkill {
         target_agent: String,
     },
+    /// Put the agent's config back as the backup has it.
+    Undo,
 }
 
 impl Pending {
@@ -1219,6 +1334,7 @@ impl Pending {
     fn verb(&self) -> &'static str {
         match self {
             Pending::OverwriteSkill { .. } => "overwrite",
+            Pending::Undo => "restore",
             _ => "delete",
         }
     }
@@ -1268,6 +1384,239 @@ struct SkillCopyPicker {
 struct Detail {
     scroll: u16,
     catalog: Option<catalog::Catalog>,
+}
+
+/// A read-only, scrolling report.
+///
+/// `doctor` and `update` both answer with a handful of findings rather than a
+/// list of things to pick from — nothing here selects, filters or applies — so
+/// they share one overlay instead of growing a pane each.
+#[derive(Debug, Clone, Default)]
+struct Report {
+    title: String,
+    lines: Vec<ReportLine>,
+    scroll: u16,
+    /// Findings that are wrong rather than merely worth knowing, counted before
+    /// the closing summary joins the list so it cannot count itself.
+    problems: usize,
+}
+
+/// One finding. Nested lines belong to the heading above them.
+#[derive(Debug, Clone)]
+struct ReportLine {
+    tone: Tone,
+    text: String,
+    nested: bool,
+}
+
+impl Report {
+    fn new(title: impl Into<String>) -> Self {
+        Self { title: title.into(), lines: Vec::new(), scroll: 0, problems: 0 }
+    }
+
+    fn line(&mut self, tone: Tone, text: impl Into<String>) {
+        self.lines.push(ReportLine { tone, text: text.into(), nested: false });
+    }
+
+    /// A finding about something the line above it named.
+    fn nested(&mut self, tone: Tone, text: impl Into<String>) {
+        self.lines.push(ReportLine { tone, text: text.into(), nested: true });
+    }
+
+    fn blank(&mut self) {
+        self.line(Tone::Info, "");
+    }
+
+    /// Close the report with a count of what is wrong, and remember it.
+    fn summarise(&mut self, none: &str) {
+        self.problems = self.lines.iter().filter(|line| line.tone == Tone::Bad).count();
+        self.blank();
+        match self.problems {
+            0 => self.line(Tone::Good, none),
+            count => self.line(Tone::Bad, format!("{count} problem(s) found")),
+        }
+    }
+}
+
+/// The whole-program check: every config parses, every referenced provider
+/// resolves, every endpoint has somewhere to call.
+///
+/// Reads the snapshots the app already holds rather than the disk, so it reports
+/// exactly what the panes are showing and needs no job to run.
+fn doctor(agents: &[AgentEntry]) -> Report {
+    let mut report = Report::new("doctor");
+
+    for agent in agents {
+        if !agent.detection.installed() {
+            report.line(Tone::Info, format!("{} not installed", agent.name));
+            continue;
+        }
+        if let Some(err) = &agent.error {
+            report.line(Tone::Bad, format!("{}: {err}", agent.name));
+            continue;
+        }
+
+        report.line(Tone::Good, format!("{} parses ({})", agent.name, agent.config_path.display()));
+
+        for provider in &agent.providers {
+            // An endpoint with nowhere to call is the one broken provider the
+            // pane cannot show you, because the column is simply blank.
+            if provider.base_url.is_none() {
+                report.nested(Tone::Bad, format!("{} has no base URL", provider.id));
+            }
+            if agent.capabilities.per_provider_models && provider.models.is_empty() {
+                report.nested(
+                    Tone::Warn,
+                    format!("{} lists no models; press s to fill them in", provider.id),
+                );
+            }
+        }
+
+        // The config names a provider that is not in it: the agent will fail at
+        // its next call, and nothing in the provider list looks wrong.
+        if let Some(active) = &agent.active {
+            if !agent.providers.iter().any(|provider| provider.id == *active) {
+                report.nested(Tone::Bad, format!("selected provider {active:?} is not configured"));
+            }
+        }
+    }
+
+    report.summarise("no problems found");
+    report
+}
+
+/// What an update check found, as a report.
+///
+/// The upgrade commands themselves stay in the CLI: this program deliberately
+/// does not replace its own binary, and the installer list they are built from
+/// lives there.
+fn update_report(status: &crate::update::Status) -> Report {
+    let mut report = Report::new("update");
+
+    match status {
+        crate::update::Status::UpToDate { current } => {
+            report.line(Tone::Good, format!("{current} is the latest release"));
+        }
+        crate::update::Status::Unreleased { current, latest } => {
+            report.line(
+                Tone::Info,
+                format!("this build is {current}, ahead of the latest release {latest}"),
+            );
+        }
+        crate::update::Status::Newer(available) => {
+            report.line(Tone::Good, format!("{} → {}", available.current, available.latest));
+            for line in available.headline(8) {
+                report.nested(Tone::Info, line);
+            }
+            report.blank();
+            report.line(Tone::Info, available.url.clone());
+            report.line(Tone::Info, "run `confai update` for the upgrade commands");
+        }
+    }
+    report
+}
+
+/// Servers from the official MCP registry, filtered as you type.
+///
+/// The query does two jobs and they are deliberately on different keys: typing
+/// filters what was already fetched, which is instant, and `ctrl+r` asks the
+/// registry again, which is an HTTP round trip. Filtering as a side effect of
+/// typing would put a request behind every keystroke.
+struct RegistryPicker {
+    /// What was last asked of the registry, and what is now filtering the answer.
+    query: String,
+    entries: Vec<registry::Entry>,
+    matches: Vec<usize>,
+    cursor: Cursor,
+}
+
+impl RegistryPicker {
+    fn new(query: String, entries: Vec<registry::Entry>) -> Self {
+        let mut picker = Self { query, entries, matches: Vec::new(), cursor: Cursor::default() };
+        picker.rebuild();
+        picker
+    }
+
+    fn rebuild(&mut self) {
+        self.matches = rank_by(&self.entries, &self.query, |entry| entry.name.clone());
+        self.cursor.clamp(self.matches.len());
+    }
+
+    fn selected(&self) -> Option<&registry::Entry> {
+        self.matches.get(self.cursor.index()).and_then(|index| self.entries.get(*index))
+    }
+}
+
+/// How a registry entry would be started, in one line.
+fn launch_summary(entry: &registry::Entry) -> String {
+    match entry.preferred() {
+        Some(registry::Launch::Package { runtime, args, .. }) => {
+            format!("{runtime} {}", args.join(" "))
+        }
+        Some(registry::Launch::Remote { url }) => url.clone(),
+        None => "nothing installable".to_string(),
+    }
+}
+
+/// The variables an entry needs that this environment does not set, written the
+/// way the status line reports them.
+///
+/// Secrets are called out because the registry knows which values are
+/// credentials and the user is the only one who has them.
+fn missing_env_of(entry: &registry::Entry) -> Vec<String> {
+    entry
+        .missing_env()
+        .iter()
+        .map(|var| format!("${}{}", var.name, if var.secret { " (a secret)" } else { "" }))
+        .collect()
+}
+
+/// What to say when a server went into the config without everything it needs.
+///
+/// `None` when it needs nothing, so the caller has no empty case to special-case.
+fn missing_note(name: &str, missing: &[String]) -> Option<String> {
+    (!missing.is_empty()).then(|| format!("added {name}, but {} not set", missing.join(", ")))
+}
+
+/// Which editor to hand a config to.
+///
+/// `VISUAL` wins over `EDITOR`, as it does everywhere else, and either being set
+/// to nothing falls through to the next candidate rather than trying to launch
+/// an empty command. The last resort is the one editor the platform is sure to
+/// have.
+fn editor_for(candidates: [Option<String>; 2]) -> String {
+    candidates.into_iter().flatten().find(|name| !name.trim().is_empty()).unwrap_or_else(|| {
+        if cfg!(windows) {
+            "notepad".into()
+        } else {
+            "vi".into()
+        }
+    })
+}
+
+/// How an editor run ended, in the terms the status line cares about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Edited {
+    Saved,
+    /// It ran and exited non-zero. The config is re-read anyway: an editor can
+    /// write a file and still fail on its way out.
+    Rejected(String),
+    /// It could not be started at all, so nothing was touched.
+    Failed(String),
+}
+
+/// What to say once the editor has gone. `problem` is what the config came back
+/// as, when it came back unparseable.
+///
+/// A config that no longer parses outranks how the editor exited: a clean exit
+/// over a broken file is the case the user most needs told about.
+fn edit_outcome(ended: &Edited, problem: Option<&str>, path: &str) -> (Tone, String) {
+    match (ended, problem) {
+        (Edited::Failed(err), _) => (Tone::Bad, err.clone()),
+        (_, Some(problem)) => (Tone::Bad, format!("{path} no longer parses: {problem}")),
+        (Edited::Saved, None) => (Tone::Good, format!("{path} still parses")),
+        (Edited::Rejected(how), None) => (Tone::Info, format!("{how}; re-read {path} anyway")),
+    }
 }
 
 /// The command palette: a query and the actions it still matches.
@@ -1400,21 +1749,30 @@ fn rank_by<T>(items: &[T], query: &str, label: impl Fn(&T) -> String) -> Vec<usi
 }
 
 enum Overlay {
-    About { scroll: u16 },
+    About {
+        scroll: u16,
+    },
     Detail(Detail),
     Form(Form),
     Confirm(Confirm),
     Presets(PresetPicker),
     Palette(CommandPalette),
     Models(ModelPicker),
-    McpDetail { scroll: u16 },
+    McpDetail {
+        scroll: u16,
+    },
     McpPresets(McpPresetPicker),
-    SkillDetail { scroll: u16 },
+    SkillDetail {
+        scroll: u16,
+    },
     SkillCopy(SkillCopyPicker),
+    /// What `doctor` or `update` had to say.
+    Report(Report),
+    Registry(RegistryPicker),
 }
 
 /// Work that must be visibly announced before it blocks the event loop.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Job {
     Check,
     CheckAll,
@@ -1426,6 +1784,14 @@ enum Job {
     Sync {
         prune: bool,
     },
+    /// Ask GitHub for the latest release, rather than waiting for the notice the
+    /// next start would show.
+    Update,
+    /// Hand the selected agent's config to `$EDITOR`, which needs the terminal
+    /// this program is drawing on.
+    EditConfig,
+    /// Ask the official MCP registry for the servers matching a query.
+    Registry(String),
 }
 
 /// Where a list was last drawn and how far it had scrolled, so a click can be
@@ -1455,7 +1821,9 @@ struct Hits {
     provider_rows: RowsAt,
     overlay: Option<Rect>,
     overlay_rows: RowsAt,
-    hints: Vec<(Rect, Action)>,
+    /// Every rect that dispatches when clicked: the hint bar, and the lens tabs
+    /// in the right pane's title.
+    clicks: Vec<(Rect, Action)>,
 }
 
 struct App {
@@ -1774,6 +2142,9 @@ impl App {
             KeyCode::Char('p') => {
                 self.dispatch_lens(Action::Preset(None), Action::McpPreset(None), None)
             }
+            // The registry lists a thousand-odd servers and the presets nine, so
+            // they are different enough things to deserve separate keys.
+            KeyCode::Char('g') if self.lens() == Lens::Mcp => self.dispatch(Action::Registry),
             // Only the skills lens has anywhere to copy something to.
             KeyCode::Char('y') if self.lens() == Lens::Skills => self.dispatch(Action::SkillCopy),
 
@@ -1785,6 +2156,9 @@ impl App {
             // Shift widens the same action, as it does for delete in most file managers.
             KeyCode::Char('S') => self.dispatch(Action::Sync { prune: true }),
             KeyCode::Char('r') => self.dispatch(Action::Reload),
+            KeyCode::Char('D') => self.dispatch(Action::Doctor),
+            KeyCode::Char('U') => self.dispatch(Action::Undo),
+            KeyCode::Char('E') => self.dispatch(Action::EditConfig),
             _ => {}
         }
     }
@@ -1826,8 +2200,8 @@ impl App {
             return;
         }
 
-        let hint = self.hits.hints.iter().find(|(rect, _)| rect.contains(at));
-        if let Some((_, action)) = hint {
+        let clicked = self.hits.clicks.iter().find(|(rect, _)| rect.contains(at));
+        if let Some((_, action)) = clicked {
             let action = action.clone();
             self.dispatch(action);
             return;
@@ -1902,6 +2276,11 @@ impl App {
                     picker.cursor = Cursor { index };
                 }
             }
+            Some(Overlay::Registry(picker)) => {
+                if let Some(index) = rows.row(at, picker.matches.len()) {
+                    picker.cursor = Cursor { index };
+                }
+            }
             _ => {}
         }
     }
@@ -1925,6 +2304,8 @@ impl App {
                 Overlay::McpPresets(picker) => picker.cursor.step(delta, picker.presets.len()),
                 Overlay::SkillDetail { scroll } => *scroll = scrolled(*scroll),
                 Overlay::SkillCopy(picker) => picker.cursor.step(delta, picker.targets.len()),
+                Overlay::Report(report) => report.scroll = scrolled(report.scroll),
+                Overlay::Registry(picker) => picker.cursor.step(delta, picker.matches.len()),
                 Overlay::Form(_) | Overlay::Confirm(_) => {}
             }
             return;
@@ -2004,7 +2385,96 @@ impl App {
             Job::McpCheck => self.mcp_check_selected(),
             Job::McpCheckAll => self.mcp_check_all(terminal),
             Job::Sync { prune } => self.sync_selected(prune),
+            Job::Update => self.check_update(),
+            Job::EditConfig => self.edit_config(terminal),
+            Job::Registry(query) => self.search_registry(&query),
         }
+    }
+
+    /// Ask the registry, and offer whatever came back as a picker.
+    fn search_registry(&mut self, query: &str) {
+        match registry::search(query, REGISTRY_LIMIT) {
+            Ok(entries) if entries.is_empty() => {
+                self.say(Tone::Info, "the registry returned nothing for that")
+            }
+            Ok(entries) => {
+                let count = entries.len();
+                self.overlay =
+                    Some(Overlay::Registry(RegistryPicker::new(query.to_string(), entries)));
+                self.say(Tone::Info, format!("{count} server(s) in the registry"));
+            }
+            Err(err) => self.say(Tone::Bad, format!("registry search failed: {err:#}")),
+        }
+    }
+
+    /// Add a registry entry to the selected agent.
+    fn install_registry(&mut self, entry: &registry::Entry) {
+        match entry.to_server(None) {
+            Ok(server) => self.install_server("mcp install", server, missing_env_of(entry)),
+            Err(err) => self.say(Tone::Bad, format!("{err:#}")),
+        }
+    }
+
+    /// Open the selected agent's config in `$EDITOR`, then re-read it.
+    ///
+    /// The editor owns the terminal while it runs, so this leaves the alternate
+    /// screen and stops reporting the mouse before spawning it: an editor drawn
+    /// into a screen this program still owns is unreadable, and its clicks would
+    /// arrive here as key sequences. Both are put back afterwards however the
+    /// editor exited.
+    fn edit_config(&mut self, terminal: &mut DefaultTerminal) {
+        let Some(path) = self.agent().map(|agent| agent.config_path.clone()) else { return };
+        let editor = editor_for([std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok()]);
+
+        let _ = ratatui::try_restore();
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+
+        let ended = match std::process::Command::new(&editor).arg(&path).status() {
+            Ok(status) if status.success() => Edited::Saved,
+            Ok(status) => Edited::Rejected(format!("{editor} exited with {status}")),
+            Err(err) => Edited::Failed(format!("could not launch {editor}: {err}")),
+        };
+
+        let _ = execute!(io::stdout(), EnableMouseCapture);
+        match ratatui::try_init() {
+            Ok(fresh) => *terminal = fresh,
+            // Without a screen there is nothing left to draw on, so leave rather
+            // than spin in a loop that cannot render.
+            Err(err) => {
+                self.say(Tone::Bad, format!("could not take the terminal back: {err}"));
+                self.quit = true;
+                return;
+            }
+        }
+        let _ = terminal.clear();
+
+        // Re-read regardless: an editor that exited badly may still have written.
+        self.refresh_selected();
+        let problem = self.agent().and_then(|agent| agent.error.clone());
+        let (tone, said) = edit_outcome(&ended, problem.as_deref(), &path.display().to_string());
+        self.say(tone, said);
+    }
+
+    /// Check for a new release now and report what came back.
+    fn check_update(&mut self) {
+        let status = match crate::update::check_now() {
+            Ok(status) => status,
+            Err(err) => return self.say(Tone::Bad, format!("update check failed: {err:#}")),
+        };
+
+        let (tone, note) = match &status {
+            crate::update::Status::UpToDate { current } => {
+                (Tone::Good, format!("{current} is the latest release"))
+            }
+            crate::update::Status::Unreleased { .. } => {
+                (Tone::Info, "this build is ahead of the latest release".to_string())
+            }
+            crate::update::Status::Newer(available) => {
+                (Tone::Good, format!("{} is available", available.latest))
+            }
+        };
+        self.overlay = Some(Overlay::Report(update_report(&status)));
+        self.say(tone, note);
     }
 
     /// Check one MCP server and remember the verdict for the health column.
@@ -2122,23 +2592,96 @@ impl App {
             }
         };
 
-        let missing: Vec<String> = entry.missing_env().iter().map(|v| v.to_string()).collect();
+        let missing = entry.missing_env().iter().map(|var| format!("${var}")).collect();
+        self.install_server("mcp preset", server, missing);
+    }
+
+    /// Add an MCP server to the selected agent and say what it still needs.
+    ///
+    /// The registry and the built-in presets both land here. Both know which
+    /// environment variables a server wants and neither can know their values,
+    /// and a server missing one starts perfectly well and then fails on its
+    /// first call — which is exactly the failure the warning exists to pre-empt.
+    /// Like the CLI, this warns rather than refusing: the server is still worth
+    /// having in the config while you go and set the variable.
+    fn install_server(&mut self, what: &str, server: mcp::Server, missing: Vec<String>) {
         let name = server.name.clone();
         let reported = name.clone();
         let agent_id = self.agent().map(|a| a.id.clone()).unwrap_or_default();
 
-        self.apply("mcp preset", move |config| {
+        self.apply(what, move |config| {
             config.upsert_mcp(&server)?;
             Ok(format!("added {reported}"))
         });
 
         self.mcp_health.forget(&agent_id, &name);
-        // The server will start without these, it just will not work; the CLI
-        // warns the same way rather than refusing.
-        if !missing.is_empty() && self.status.tone == Tone::Good {
-            self.say(Tone::Info, format!("added {name}, but ${} is not set", missing.join(", $")));
+        // Only worth saying if the write itself succeeded; otherwise the failure
+        // is the news.
+        if self.status.tone == Tone::Good {
+            if let Some(note) = missing_note(&name, &missing) {
+                self.say(Tone::Warn, note);
+            }
         }
         self.select_server(&name);
+    }
+
+    /// Report on the configs as they are currently loaded.
+    ///
+    /// Deliberately does not re-read the disk. Every write this program makes
+    /// refreshes its own snapshot, so the loaded model is current; reporting on
+    /// it means doctor can never contradict the pane beside it, and `r` is there
+    /// for a config that changed under us.
+    fn open_doctor(&mut self) {
+        let report = doctor(&self.agents);
+        let problems = report.problems;
+        self.overlay = Some(Overlay::Report(report));
+        if problems == 0 {
+            self.say(Tone::Good, "doctor found no problems");
+        } else {
+            self.say(Tone::Bad, format!("doctor found {problems} problem(s)"));
+        }
+    }
+
+    /// Ask before putting a config back: the restore overwrites whatever is
+    /// there now, and unlike every other write in this program it takes no
+    /// backup of what it replaces.
+    fn ask_undo(&mut self) {
+        let Some(agent) = self.agent() else { return };
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            prompt: format!(
+                "Restore {} from the backup taken before {} last wrote to it? Anything changed                  since then is lost.",
+                agent.config_path.display(),
+                brand::NAME
+            ),
+            agent_id: agent.id.clone(),
+            subject_id: agent.name.clone(),
+            pending: Pending::Undo,
+        }));
+    }
+
+    fn undo(&mut self, agent_id: &str) {
+        let Some((name, path)) = self
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .map(|agent| (agent.name.clone(), agent.config_path.clone()))
+        else {
+            return;
+        };
+
+        match store::restore_backup(&path) {
+            Ok(true) => {
+                self.refresh_selected();
+                self.say(Tone::Good, format!("restored {}", path.display()));
+            }
+            // Not a failure: there is simply nothing to put back, which is the
+            // normal state of a config this program has never written to.
+            Ok(false) => self.say(
+                Tone::Info,
+                format!("nothing to undo; {} has not written to {name}'s config", brand::NAME),
+            ),
+            Err(err) => self.say(Tone::Bad, format!("undo failed: {err:#}")),
+        }
     }
 
     fn open_skill_detail(&mut self) {
@@ -2488,6 +3031,9 @@ impl App {
                 scroll_key(key, scroll).map(|scroll| Overlay::SkillDetail { scroll })
             }
             Overlay::SkillCopy(picker) => self.skill_copy_key(key, picker),
+            Overlay::Registry(picker) => self.registry_key(key, raw, picker),
+            Overlay::Report(report) => scroll_key(key, report.scroll)
+                .map(|scroll| Overlay::Report(Report { scroll, ..report })),
         };
         // A handler that opened its own overlay — a form, the preset picker —
         // wins over the one it replaced.
@@ -2564,6 +3110,45 @@ impl App {
             _ => {}
         }
         Some(Overlay::Models(picker))
+    }
+
+    fn registry_key(
+        &mut self,
+        key: KeyEvent,
+        raw: KeyEvent,
+        mut picker: RegistryPicker,
+    ) -> Option<Overlay> {
+        // Asking the registry again is a round trip, so it is its own key rather
+        // than something typing sets off.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            let query = picker.query.clone();
+            self.schedule(Job::Registry(query), "searching the MCP registry...");
+            return Some(Overlay::Registry(picker));
+        }
+
+        match key.code {
+            KeyCode::Esc => return None,
+            KeyCode::Enter => {
+                if let Some(entry) = picker.selected().cloned() {
+                    self.install_registry(&entry);
+                }
+                return None;
+            }
+            KeyCode::Up => picker.cursor.step(-1, picker.matches.len()),
+            KeyCode::Down => picker.cursor.step(1, picker.matches.len()),
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.rebuild();
+            }
+            KeyCode::Char(_) => {
+                if let KeyCode::Char(typed) = raw.code {
+                    picker.query.push(typed);
+                    picker.rebuild();
+                }
+            }
+            _ => {}
+        }
+        Some(Overlay::Registry(picker))
     }
 
     fn form_key(&mut self, key: KeyEvent, raw: KeyEvent, mut form: Form) -> Option<Overlay> {
@@ -2714,6 +3299,7 @@ impl App {
                         });
                     }
                     Pending::DeleteSkill => self.delete_skill(&agent_id, &id),
+                    Pending::Undo => self.undo(&agent_id),
                     Pending::OverwriteSkill { target_agent } => {
                         self.overwrite_skill(&agent_id, &target_agent, &id)
                     }
@@ -2879,11 +3465,14 @@ impl App {
             Layout::horizontal([Constraint::Length(AGENT_PANE_WIDTH), Constraint::Min(24)])
                 .areas(body);
 
+        let left_at = self.agent_pane(left).render(frame, left);
+        let right_at = self.right_pane(right).render(frame, right);
         let mut hits = Hits {
             agents: left,
             providers: right,
-            agent_rows: self.agent_pane(left).render(frame, left),
-            provider_rows: self.right_pane(right).render(frame, right),
+            agent_rows: left_at.rows,
+            provider_rows: right_at.rows,
+            clicks: right_at.clicks,
             ..Hits::default()
         };
 
@@ -2894,7 +3483,7 @@ impl App {
             ])),
             status,
         );
-        hits.hints = self.render_hints(frame, hints);
+        hits.clicks.extend(self.render_hints(frame, hints));
 
         match &self.overlay {
             Some(Overlay::About { scroll }) => hits.overlay = Some(render_about(frame, *scroll)),
@@ -2929,6 +3518,12 @@ impl App {
             }
             Some(Overlay::SkillCopy(picker)) => {
                 let (area, rows) = render_skill_copy(frame, picker);
+                hits.overlay = Some(area);
+                hits.overlay_rows = rows;
+            }
+            Some(Overlay::Report(report)) => hits.overlay = Some(render_report(frame, report)),
+            Some(Overlay::Registry(picker)) => {
+                let (area, rows) = render_registry(frame, picker);
                 hits.overlay = Some(area);
                 hits.overlay_rows = rows;
             }
@@ -3040,7 +3635,8 @@ impl App {
             Some(Overlay::About { .. })
             | Some(Overlay::Detail(_))
             | Some(Overlay::McpDetail { .. })
-            | Some(Overlay::SkillDetail { .. }) => {
+            | Some(Overlay::SkillDetail { .. })
+            | Some(Overlay::Report(_)) => {
                 vec![Hint::plain("↑↓", "scroll"), Hint::plain("esc", "close")]
             }
             Some(Overlay::Form(form)) if form.editing => vec![
@@ -3074,6 +3670,13 @@ impl App {
                 Hint::plain("enter", "run"),
                 Hint::plain("esc", "close"),
             ],
+            Some(Overlay::Registry(_)) => vec![
+                Hint::plain("type", "filter"),
+                Hint::plain("ctrl+r", "search registry"),
+                Hint::plain("arrows", "move"),
+                Hint::plain("enter", "install"),
+                Hint::plain("esc", "cancel"),
+            ],
             Some(Overlay::Models(_)) => vec![
                 Hint::plain("type", "filter"),
                 Hint::plain("↑↓", "move"),
@@ -3088,8 +3691,13 @@ impl App {
             None => {
                 let mut hints = vec![Hint::plain("↑↓", "move")];
                 hints.extend(match (self.focus, self.lens()) {
+                    // The agent pane's bar carries what applies to the agent as a
+                    // whole, rather than to a row of the list beside it.
                     (Pane::Agents, _) => Hint::bar([
                         Action::Lens(None),
+                        Action::EditConfig,
+                        Action::Undo,
+                        Action::Doctor,
                         Action::Palette,
                         Action::Reload,
                         Action::Help,
@@ -3120,6 +3728,7 @@ impl App {
                         Action::McpDelete,
                         Action::McpCheck,
                         Action::McpPreset(None),
+                        Action::Registry,
                         Action::Palette,
                         Action::Help,
                     ]),
@@ -3170,7 +3779,7 @@ impl App {
             .collect();
 
         ListPane {
-            title: format!("agents {}", self.agents.len()),
+            title: format!("agents {}", self.agents.len()).into(),
             focused: self.focus == Pane::Agents,
             header: Some(columns.header(&["", "agent", "prv", ""])),
             rows,
@@ -3188,19 +3797,34 @@ impl App {
         }
     }
 
-    /// ` Codex · providers 11 `, carrying the filter clause when one is live.
-    fn pane_title(&self, agent: &AgentEntry, lens: Lens, shown: usize, total: usize) -> String {
+    /// ` Codex · providers 11 │ mcp 3 `: the agent, then one tab per lens it has,
+    /// with the one in force picked out and the others a click away.
+    ///
+    /// Falls back to ` Codex · providers 11 ` when the tabs would be cut, and
+    /// carries the filter clause instead when one is live.
+    fn pane_title(
+        &self,
+        agent: &AgentEntry,
+        lens: Lens,
+        shown: usize,
+        total: usize,
+        pane_width: u16,
+    ) -> PaneTitle {
+        // While you are filtering, the query is what the line is for; tabs would
+        // crowd it off the end of a title that has to fit either way.
         if self.filter.active() || self.filter.editing {
-            format!(
+            return PaneTitle::plain(format!(
                 "{} · {} {shown}/{total} · /{}{}",
                 agent.name,
                 lens.label(),
                 self.filter.query,
                 if self.filter.editing { CURSOR_BAR } else { "" }
-            )
-        } else {
-            format!("{} · {} {total}", agent.name, lens.label())
+            ));
         }
+
+        lens_tabs(agent, lens).filter(|tabs| tabs.fits(pane_width)).unwrap_or_else(|| {
+            PaneTitle::plain(format!("{} · {} {total}", agent.name, lens.label()))
+        })
     }
 
     fn provider_pane(&self, area: Rect) -> ListPane {
@@ -3210,7 +3834,7 @@ impl App {
         };
         if let Some(err) = &agent.error {
             return ListPane::notice(
-                &format!("{} · providers", agent.name),
+                format!("{} · providers", agent.name),
                 focused,
                 vec![err.clone()],
             );
@@ -3218,11 +3842,11 @@ impl App {
 
         let total = agent.providers.len();
         let visible = self.visible_providers();
-        let title = self.pane_title(agent, Lens::Providers, visible.len(), total);
+        let title = self.pane_title(agent, Lens::Providers, visible.len(), total, area.width);
 
         if total == 0 {
             return ListPane::notice(
-                &title,
+                title.clone(),
                 focused,
                 vec![
                     format!("{} knows no providers yet", agent.name),
@@ -3233,7 +3857,7 @@ impl App {
         }
         if visible.is_empty() {
             return ListPane::notice(
-                &title,
+                title.clone(),
                 focused,
                 vec![
                     format!("nothing matches \"{}\"", self.filter.query.trim()),
@@ -3313,16 +3937,16 @@ impl App {
             return ListPane::notice("mcp", focused, vec!["no agent selected".to_string()]);
         };
         if let Some(err) = &agent.error {
-            return ListPane::notice(&format!("{} · mcp", agent.name), focused, vec![err.clone()]);
+            return ListPane::notice(format!("{} · mcp", agent.name), focused, vec![err.clone()]);
         }
 
         let total = agent.mcp.len();
         let visible = self.visible_servers();
-        let title = self.pane_title(agent, Lens::Mcp, visible.len(), total);
+        let title = self.pane_title(agent, Lens::Mcp, visible.len(), total, area.width);
 
         if total == 0 {
             return ListPane::notice(
-                &title,
+                title.clone(),
                 focused,
                 vec![
                     format!("{} launches no MCP servers yet", agent.name),
@@ -3333,7 +3957,7 @@ impl App {
         }
         if visible.is_empty() {
             return ListPane::notice(
-                &title,
+                title.clone(),
                 focused,
                 vec![
                     format!("nothing matches \"{}\"", self.filter.query.trim()),
@@ -3402,7 +4026,7 @@ impl App {
         };
         let Some(dir) = &agent.skills_dir else {
             return ListPane::notice(
-                &format!("{} · skills", agent.name),
+                format!("{} · skills", agent.name),
                 focused,
                 vec![format!("{} does not keep skills", agent.name)],
             );
@@ -3410,11 +4034,11 @@ impl App {
 
         let total = agent.skills.len();
         let visible = self.visible_skills();
-        let title = self.pane_title(agent, Lens::Skills, visible.len(), total);
+        let title = self.pane_title(agent, Lens::Skills, visible.len(), total, area.width);
 
         if total == 0 {
             return ListPane::notice(
-                &title,
+                title.clone(),
                 focused,
                 vec![
                     format!("{} has no skills installed", agent.name),
@@ -3429,7 +4053,7 @@ impl App {
         }
         if visible.is_empty() {
             return ListPane::notice(
-                &title,
+                title.clone(),
                 focused,
                 vec![
                     format!("nothing matches \"{}\"", self.filter.query.trim()),
@@ -3691,6 +4315,35 @@ impl App {
     }
 }
 
+fn render_registry(frame: &mut Frame, picker: &RegistryPicker) -> (Rect, RowsAt) {
+    let search = Search {
+        title: "mcp registry",
+        query: &picker.query,
+        placeholder: "type to filter these, ctrl+r to ask the registry again",
+        empty: "nothing fetched matches that; ctrl+r asks the registry",
+        count: picker.matches.len(),
+        selected: picker.cursor.index(),
+    };
+
+    render_search_overlay(frame, search, |width| {
+        let columns = Columns::flexible(width, &[30, 24], 2, 18);
+        picker
+            .matches
+            .iter()
+            .filter_map(|index| picker.entries.get(*index))
+            .map(|entry| {
+                let mut row = Row::default();
+                row.cell(&columns, &entry.name, Style::default().fg(palette::TEXT));
+                row.cell(&columns, &launch_summary(entry), Style::default().fg(palette::MUTED));
+                row.cell(&columns, &entry.description, Style::default().fg(palette::FAINT));
+                // Nothing this program can start is nothing worth choosing.
+                row.dim = entry.preferred().is_none();
+                row
+            })
+            .collect()
+    })
+}
+
 fn render_models(frame: &mut Frame, picker: &ModelPicker) -> (Rect, RowsAt) {
     let search = Search {
         title: &format!("models · {}", picker.provider_id),
@@ -3844,6 +4497,37 @@ fn overlay_frame(frame: &mut Frame, area: Rect, title: &str) -> Rect {
     inner
 }
 
+/// A report as an overlay: one glyph-led line per finding, scrolled like the
+/// other read-only screens.
+fn render_report(frame: &mut Frame, report: &Report) -> Rect {
+    let lines: Vec<Line> = report
+        .lines
+        .iter()
+        .map(|line| {
+            if line.text.is_empty() {
+                return Line::default();
+            }
+            let indent = if line.nested { "    " } else { "  " };
+            Line::from(vec![
+                Span::styled(format!("{indent}{} ", line.tone.glyph()), line.tone.style()),
+                Span::styled(
+                    line.text.clone(),
+                    Style::default().fg(if line.nested { palette::MUTED } else { palette::TEXT }),
+                ),
+            ])
+        })
+        .collect();
+
+    let area = centered(frame.area(), 74, 80);
+    let inner = overlay_frame(frame, area, &report.title);
+    // Wrapped, because a parse error arrives as a sentence rather than a column.
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((report.scroll, 0)),
+        inner,
+    );
+    area
+}
+
 fn render_about(frame: &mut Frame, scroll: u16) -> Rect {
     let mut lines: Vec<Line> = brand::logo_lines()
         .map(|line| {
@@ -3866,8 +4550,13 @@ fn render_about(frame: &mut Frame, scroll: u16) -> Rect {
     let bindings = |actions: Vec<Action>| -> Vec<(String, String)> {
         actions
             .iter()
-            .filter_map(|action| {
-                action.binding().map(|key| (key.to_string(), action.description()))
+            .map(|action| {
+                // An action with no key of its own is still something the program
+                // does, so it is listed with the way to reach it rather than
+                // left off the only complete map of what exists.
+                let key =
+                    action.binding().map(str::to_string).unwrap_or_else(|| "(commands)".into());
+                (key, action.description())
             })
             .collect()
     };
@@ -4011,7 +4700,7 @@ fn render_presets(frame: &mut Frame, picker: &PresetPicker) -> (Rect, RowsAt) {
         .collect();
 
     let rows_at = ListPane {
-        title: format!("presets {}", picker.presets.len()),
+        title: format!("presets {}", picker.presets.len()).into(),
         focused: true,
         header: Some(columns.header(&["preset", "name", "base url"])),
         rows,
@@ -4044,7 +4733,7 @@ fn render_mcp_presets(frame: &mut Frame, picker: &McpPresetPicker) -> (Rect, Row
         .collect();
 
     let rows_at = ListPane {
-        title: format!("mcp presets {}", picker.presets.len()),
+        title: format!("mcp presets {}", picker.presets.len()).into(),
         focused: true,
         header: Some(columns.header(&["preset", "command or url", "what it does"])),
         rows,
@@ -4076,7 +4765,7 @@ fn render_skill_copy(frame: &mut Frame, picker: &SkillCopyPicker) -> (Rect, Rows
         .collect();
 
     let rows_at = ListPane {
-        title: format!("copy {} to", picker.skill),
+        title: format!("copy {} to", picker.skill).into(),
         focused: true,
         header: Some(columns.header(&["agent", "lands at"])),
         rows,
@@ -4168,10 +4857,116 @@ fn render_rows(
     RowsAt { area, offset: state.offset() }
 }
 
+/// How one run of a pane title is coloured.
+///
+/// Chrome follows the pane's focus, as the whole title did before the lens grew
+/// tabs. The tab roles are fixed instead, so which lens is in force reads the
+/// same whether or not the pane holds the focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleRole {
+    Chrome,
+    Active,
+    Inactive,
+    Separator,
+}
+
+#[derive(Debug, Clone)]
+struct TitlePart {
+    text: String,
+    role: TitleRole,
+    /// The lens this run stands for, when it is a tab.
+    lens: Option<Lens>,
+}
+
+/// A pane title, kept in runs so the lens tabs can be coloured and hit-tested
+/// apart from the rest of the line.
+#[derive(Debug, Default, Clone)]
+struct PaneTitle {
+    parts: Vec<TitlePart>,
+}
+
+impl PaneTitle {
+    fn plain(text: impl Into<String>) -> Self {
+        Self { parts: vec![TitlePart { text: text.into(), role: TitleRole::Chrome, lens: None }] }
+    }
+
+    fn push(&mut self, role: TitleRole, text: impl Into<String>, lens: Option<Lens>) {
+        self.parts.push(TitlePart { text: text.into(), role, lens });
+    }
+
+    /// Columns the title occupies, counting the space it is padded with on each
+    /// side so the border does not run into the words.
+    fn width(&self) -> u16 {
+        let text: usize = self.parts.iter().map(|part| part.text.chars().count()).sum();
+        (text + 2) as u16
+    }
+
+    /// Whether a pane this wide can draw the title whole. A title lives on the
+    /// top border, between two rounded corners it may not overwrite.
+    fn fits(&self, pane_width: u16) -> bool {
+        self.width() <= pane_width.saturating_sub(2)
+    }
+
+    fn line(&self, chrome: Style) -> Line<'static> {
+        let mut spans = vec![Span::styled(" ", chrome)];
+        spans.extend(self.parts.iter().map(|part| {
+            let style = match part.role {
+                TitleRole::Chrome => chrome,
+                TitleRole::Active => {
+                    Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD)
+                }
+                TitleRole::Inactive => Style::default().fg(palette::MUTED),
+                TitleRole::Separator => Style::default().fg(palette::FAINT),
+            };
+            Span::styled(part.text.clone(), style)
+        }));
+        spans.push(Span::styled(" ", chrome));
+        Line::from(spans)
+    }
+
+    /// Where each selectable tab landed on the pane's top border.
+    ///
+    /// The active tab is left out: clicking the lens you are already reading
+    /// should not move the focus or clear anything.
+    fn tabs_at(&self, area: Rect) -> Vec<(Rect, Action)> {
+        // Past the left corner, then past the pad [`Self::line`] opens with.
+        let mut x = area.x + 2;
+        let mut tabs = Vec::new();
+        for part in &self.parts {
+            let width = part.text.chars().count() as u16;
+            if let (TitleRole::Inactive, Some(lens)) = (part.role, part.lens) {
+                tabs.push((Rect { x, y: area.y, width, height: 1 }, Action::Lens(Some(lens))));
+            }
+            x += width;
+        }
+        tabs
+    }
+}
+
+impl From<&str> for PaneTitle {
+    fn from(text: &str) -> Self {
+        Self::plain(text)
+    }
+}
+
+impl From<String> for PaneTitle {
+    fn from(text: String) -> Self {
+        Self::plain(text)
+    }
+}
+
+/// What a rendered pane left behind for the mouse.
+#[derive(Debug, Default)]
+struct PaneAt {
+    rows: RowsAt,
+    /// Rects that dispatch when clicked; only the lens tabs, so far.
+    clicks: Vec<(Rect, Action)>,
+}
+
 /// A bordered, scrolling list with a column header and an empty state. Every
 /// list in the app is this shape.
 struct ListPane {
-    title: String,
+    title: PaneTitle,
     focused: bool,
     header: Option<Line<'static>>,
     rows: Vec<Row>,
@@ -4181,28 +4976,22 @@ struct ListPane {
 }
 
 impl ListPane {
-    fn notice(title: &str, focused: bool, empty: Vec<String>) -> Self {
-        Self {
-            title: title.to_string(),
-            focused,
-            header: None,
-            rows: Vec::new(),
-            selected: 0,
-            empty,
-        }
+    fn notice(title: impl Into<PaneTitle>, focused: bool, empty: Vec<String>) -> Self {
+        Self { title: title.into(), focused, header: None, rows: Vec::new(), selected: 0, empty }
     }
 
-    fn render(self, frame: &mut Frame, area: Rect) -> RowsAt {
-        let (border, title) = if self.focused {
+    fn render(self, frame: &mut Frame, area: Rect) -> PaneAt {
+        let (border, chrome) = if self.focused {
             (palette::ACCENT, Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD))
         } else {
             (palette::FAINT, Style::default().fg(palette::MUTED))
         };
+        let clicks = self.title.tabs_at(area);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border))
-            .title(Span::styled(format!(" {} ", self.title), title));
-        self.fill(frame, area, block)
+            .title(self.title.line(chrome));
+        PaneAt { rows: self.fill(frame, area, block), clicks }
     }
 
     /// The same pane wearing an overlay's chrome rather than a pane border.
@@ -4211,10 +5000,9 @@ impl ListPane {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette::ACCENT))
-            .title(Span::styled(
-                format!(" {} ", self.title),
-                Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD),
-            ))
+            .title(
+                self.title.line(Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD)),
+            )
             .style(Style::default().bg(palette::OVERLAY_BG).fg(palette::TEXT));
         self.fill(frame, area, block)
     }
@@ -4359,10 +5147,18 @@ fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
 mod render_tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
     use ratatui::Terminal;
 
     /// A fixed two-agent scene, so a render test does not depend on what happens
     /// to be installed on the machine running it.
+    ///
+    /// The agents are a fixture but their ids are real, and [`App::apply`]
+    /// resolves an id against the machine rather than against this list. Any
+    /// test that reaches a write — `apply`, `install_server`, `save_form`, a
+    /// confirmed delete — therefore edits the real config of whoever is running
+    /// the suite. Test the pure part instead, or use an id nothing resolves.
     fn scene() -> App {
         let mut codex = AgentEntry {
             id: "codex".into(),
@@ -4480,16 +5276,19 @@ mod render_tests {
         )
     }
 
+    /// Render one frame the way [`App::draw`] does — remembering where
+    /// everything landed — and hand back the cells for inspection.
+    fn draw(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        let mut hits = Hits::default();
+        terminal.draw(|frame| hits = app.render(frame)).expect("draw");
+        app.hits = hits;
+        terminal.backend().buffer().clone()
+    }
+
     /// Render one frame and return it as text, so a failure shows the screen.
     fn screen(app: &mut App, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
-        terminal
-            .draw(|frame| {
-                app.render(frame);
-            })
-            .expect("draw");
-
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = draw(app, width, height);
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -4598,6 +5397,556 @@ mod render_tests {
         assert_eq!(app.lens(), Lens::Skills);
         app.dispatch(Action::Lens(None));
         assert_eq!(app.lens(), Lens::Providers);
+    }
+
+    /// The right pane's top border, run by run, with the colour and weight each
+    /// run was drawn in: what tells an active tab from an inactive one.
+    fn title_runs(app: &mut App, width: u16, height: u16) -> Vec<(String, Color, bool)> {
+        let buffer = draw(app, width, height);
+        let pane = app.hits.providers;
+        let mut runs: Vec<(String, Color, bool)> = Vec::new();
+        for x in (pane.x + 1)..pane.right().saturating_sub(1) {
+            let cell = &buffer[(x, pane.y)];
+            let bold = cell.modifier.contains(Modifier::BOLD);
+            match runs.last_mut() {
+                Some((text, colour, weight)) if *colour == cell.fg && *weight == bold => {
+                    text.push_str(cell.symbol())
+                }
+                _ => runs.push((cell.symbol().to_string(), cell.fg, bold)),
+            }
+        }
+        runs
+    }
+
+    /// What the tabs of a title read, in order.
+    fn tab_labels(title: &PaneTitle) -> Vec<String> {
+        title
+            .parts
+            .iter()
+            .filter(|part| part.lens.is_some())
+            .map(|part| part.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_title_offers_a_tab_for_every_lens_the_agent_has_and_no_others() {
+        let mut app = scene();
+
+        // Codex runs MCP servers but keeps no skills, so it is offered two tabs
+        // rather than three with one greyed out.
+        let codex = lens_tabs(&app.agents[0], Lens::Providers).expect("Codex has two lenses");
+        assert_eq!(tab_labels(&codex), ["providers 3", "mcp 3"]);
+
+        // opencode has all three. A lens counts what it holds even when that is
+        // nothing: an empty list is a fact, an absent tab is a different one.
+        let opencode = lens_tabs(&app.agents[1], Lens::Skills).expect("opencode has three lenses");
+        assert_eq!(tab_labels(&opencode), ["providers 0", "mcp 0", "skills 2"]);
+
+        // One lens is no choice, so there are no tabs to draw at all.
+        app.agents[0].capabilities.mcp = false;
+        assert!(lens_tabs(&app.agents[0], Lens::Providers).is_none());
+    }
+
+    #[test]
+    fn only_the_inactive_tabs_are_click_targets() {
+        let app = scene();
+        let title = lens_tabs(&app.agents[0], Lens::Mcp).expect("Codex has two lenses");
+        let tabs = title.tabs_at(Rect::new(0, 0, 80, 10));
+
+        assert_eq!(tabs.len(), 1, "the lens already in force must not be a target: {tabs:?}");
+        assert_eq!(tabs[0].1, Action::Lens(Some(Lens::Providers)));
+        // Past the corner, the title's pad, "Codex ·" and the space after it.
+        assert_eq!(tabs[0].0.x, 2 + "Codex ·".chars().count() as u16 + 1);
+        assert_eq!(tabs[0].0.width, "providers 3".chars().count() as u16);
+        assert_eq!(tabs[0].0.height, 1, "a tab is one row of the border");
+    }
+
+    #[test]
+    fn clicking_a_tab_jumps_to_that_lens_rather_than_cycling_towards_it() {
+        let mut app = scene();
+        // opencode, the agent with all three lenses, so a jump and a cycle step
+        // land somewhere different.
+        app.agent_cursor = Cursor { index: 1 };
+        draw(&mut app, 120, 30);
+
+        let tab = |app: &App, lens| {
+            app.hits
+                .clicks
+                .iter()
+                .find(|(_, action)| *action == Action::Lens(Some(lens)))
+                .map(|(rect, _)| *rect)
+        };
+
+        let skills = tab(&app, Lens::Skills).expect("no skills tab");
+        app.on_click(Position::new(skills.x, skills.y));
+        assert_eq!(app.lens(), Lens::Skills, "the tab must select, not cycle");
+
+        // Clicking where you already are is not an action.
+        draw(&mut app, 120, 30);
+        assert!(tab(&app, Lens::Skills).is_none(), "the active tab is still clickable");
+        app.on_click(Position::new(skills.right() - 1, skills.y));
+        assert_eq!(app.lens(), Lens::Skills);
+
+        // And the way back is one click, not two.
+        let providers = tab(&app, Lens::Providers).expect("no providers tab");
+        app.on_click(Position::new(providers.x, providers.y));
+        assert_eq!(app.lens(), Lens::Providers);
+    }
+
+    #[test]
+    fn a_pane_too_narrow_for_the_tabs_names_only_the_lens_in_force() {
+        let mut app = scene();
+        // " Codex · providers 3 │ mcp 3 " against the pane's two corners.
+        let tabs = lens_tabs(&app.agents[0], Lens::Providers).expect("Codex has two lenses");
+        assert_eq!(tabs.width(), 29);
+        assert!(!tabs.fits(30), "the tabs must not claim a pane they overflow");
+        assert!(tabs.fits(31));
+
+        let narrow = screen(&mut app, AGENT_PANE_WIDTH + 30, 30);
+        assert!(!narrow.contains("mcp 3"), "tabs drawn into a pane too narrow:\n{narrow}");
+        assert!(narrow.contains("providers 3"), "the fallback names no lens:\n{narrow}");
+
+        let wide = screen(&mut app, AGENT_PANE_WIDTH + 31, 30);
+        assert!(wide.contains("mcp 3"), "the tabs are withheld from a pane that fits:\n{wide}");
+    }
+
+    #[test]
+    fn the_active_tab_reads_differently_from_the_ones_beside_it() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        let runs = title_runs(&mut app, 120, 30);
+
+        let run = |needle: &str| {
+            runs.iter()
+                .find(|(text, ..)| text.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in the title: {runs:?}"))
+                .clone()
+        };
+        let (_, active, active_bold) = run("mcp 3");
+        let (_, idle, idle_bold) = run("providers 3");
+
+        assert_eq!(active, palette::ACCENT);
+        assert!(active_bold, "the active tab is not bold");
+        assert_eq!(idle, palette::MUTED);
+        assert!(!idle_bold, "an inactive tab must not compete with the active one");
+
+        // Two tabs, one separator: Codex keeps no skills.
+        let title: String = runs.iter().map(|(text, ..)| text.as_str()).collect();
+        assert_eq!(title.matches(TAB_SEPARATOR.trim()).count(), 1, "not two tabs: {title:?}");
+        assert!(!title.contains("skills"), "a lens Codex does not have: {title:?}");
+    }
+
+    /// Every finding of a report, glyph and all, as one searchable string.
+    fn findings(report: &Report) -> String {
+        report
+            .lines
+            .iter()
+            .map(|line| format!("{} {}", line.tone.glyph(), line.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn doctor_passes_a_scene_where_nothing_is_wrong() {
+        let report = doctor(&scene().agents);
+        assert_eq!(report.problems, 0, "clean scene reported problems:\n{}", findings(&report));
+        assert!(findings(&report).contains("no problems found"));
+        // Both agents are accounted for, not just the one under the cursor.
+        assert!(findings(&report).contains("Codex parses"), "{}", findings(&report));
+        assert!(findings(&report).contains("opencode parses"), "{}", findings(&report));
+    }
+
+    #[test]
+    fn doctor_reports_a_selected_provider_that_is_not_configured() {
+        let mut app = scene();
+        app.agents[0].active = Some("ghost".into());
+
+        let report = doctor(&app.agents);
+        assert_eq!(report.problems, 1, "{}", findings(&report));
+        assert!(findings(&report).contains("\"ghost\" is not configured"), "{}", findings(&report));
+        assert!(findings(&report).contains("1 problem(s) found"));
+    }
+
+    #[test]
+    fn doctor_separates_what_is_broken_from_what_merely_wants_attention() {
+        let mut app = scene();
+        // No base URL is broken: the endpoint has nowhere to call.
+        app.agents[0].providers[0].base_url = None;
+        // An empty model list is worth saying and is not a fault.
+        app.agents[1].providers.push(Provider::new("modelless"));
+        app.agents[1].providers[0].base_url = Some("https://example.invalid/v1".into());
+
+        let report = doctor(&app.agents);
+        let text = findings(&report);
+        assert_eq!(report.problems, 1, "a warning was counted as a problem:\n{text}");
+        assert!(text.contains("✗ primary has no base URL"), "{text}");
+        assert!(text.contains("! modelless lists no models"), "{text}");
+    }
+
+    #[test]
+    fn doctor_says_which_config_would_not_parse_and_stops_there() {
+        let mut app = scene();
+        app.agents[0].error = Some("expected `=` at line 4".into());
+
+        let report = doctor(&app.agents);
+        let text = findings(&report);
+        assert_eq!(report.problems, 1, "{text}");
+        assert!(text.contains("Codex: expected `=` at line 4"), "{text}");
+        // A config that did not parse has no providers worth checking.
+        assert!(!text.contains("Codex parses"), "{text}");
+        assert!(!text.contains("has no base URL"), "unparsed config still walked:\n{text}");
+    }
+
+    #[test]
+    fn doctor_passes_over_an_agent_that_is_not_installed() {
+        let mut app = scene();
+        app.agents[0].detection = Detection { binary_on_path: false, config_exists: false };
+        app.agents[0].active = Some("ghost".into());
+
+        let report = doctor(&app.agents);
+        let text = findings(&report);
+        // Nothing is wrong with an agent you do not have.
+        assert_eq!(report.problems, 0, "{text}");
+        assert!(text.contains("· Codex not installed"), "{text}");
+    }
+
+    #[test]
+    fn the_doctor_overlay_draws_its_findings_and_says_so_on_the_status_line() {
+        let mut app = scene();
+        app.agents[0].active = Some("ghost".into());
+        app.dispatch(Action::Doctor);
+
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("doctor"), "no report title:\n{text}");
+        assert!(text.contains("is not configured"), "the finding is not on screen:\n{text}");
+        assert!(text.contains("doctor found"), "nothing said on the status line:\n{text}");
+    }
+
+    fn version(text: &str) -> semver::Version {
+        text.parse().expect("version")
+    }
+
+    #[test]
+    fn an_update_check_reports_every_outcome_it_can_have() {
+        let up_to_date =
+            update_report(&crate::update::Status::UpToDate { current: version("0.0.3") });
+        assert!(findings(&up_to_date).contains("0.0.3 is the latest release"));
+
+        // Running from a working tree is normal, not a fault.
+        let unreleased = update_report(&crate::update::Status::Unreleased {
+            current: version("0.1.0"),
+            latest: version("0.0.3"),
+        });
+        assert!(findings(&unreleased).contains("ahead of the latest release 0.0.3"));
+        assert_eq!(unreleased.problems, 0);
+    }
+
+    #[test]
+    fn a_newer_release_is_reported_with_what_changed_in_it() {
+        let available = crate::update::Available {
+            current: version("0.0.3"),
+            latest: version("0.1.0"),
+            notes: "## 0.1.0\n\n- skills as a third lens\n- clickable lens tabs\n".into(),
+            url: "https://example.invalid/releases/0.1.0".into(),
+        };
+        let report = update_report(&crate::update::Status::Newer(Box::new(available)));
+        let text = findings(&report);
+
+        assert!(text.contains("0.0.3 → 0.1.0"), "no version delta:\n{text}");
+        // The changelog is the reason to care, so it is in the report.
+        assert!(text.contains("skills as a third lens"), "no changelog bullets:\n{text}");
+        assert!(text.contains("https://example.invalid/releases/0.1.0"), "no link:\n{text}");
+        // This program does not replace its own binary; the CLI names the way.
+        assert!(text.contains("confai update"), "no route to the upgrade:\n{text}");
+    }
+
+    #[test]
+    fn the_update_check_is_announced_before_it_reaches_the_network() {
+        let mut app = scene();
+        app.dispatch(Action::Update);
+
+        // The job is queued, not run: the frame saying so has to land first.
+        assert!(matches!(app.pending, Some(Job::Update)), "the check was not scheduled");
+        assert!(app.status.text.contains("latest release"), "unannounced: {:?}", app.status.text);
+        assert!(app.overlay.is_none(), "the report cannot exist before the check ran");
+    }
+
+    #[test]
+    fn undo_asks_first_and_says_what_it_would_lose() {
+        let mut app = scene();
+        app.dispatch(Action::Undo);
+
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            panic!("undo went ahead without asking");
+        };
+        assert_eq!(confirm.pending, Pending::Undo);
+        assert_eq!(confirm.pending.verb(), "restore", "the y key must not say delete");
+        assert!(confirm.prompt.contains("config.toml"), "no path named: {:?}", confirm.prompt);
+        assert!(confirm.prompt.contains("lost"), "the cost is not stated: {:?}", confirm.prompt);
+
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("y restore") && text.contains("n cancel"), "no hints:\n{text}");
+    }
+
+    #[test]
+    fn declining_the_undo_leaves_the_config_alone() {
+        let mut app = scene();
+        app.dispatch(Action::Undo);
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+
+        assert!(app.overlay.is_none(), "the confirm stayed open");
+        assert!(app.status.text.contains("cancelled"), "{:?}", app.status.text);
+    }
+
+    #[test]
+    fn undoing_an_agent_with_no_backup_is_not_an_error() {
+        let mut app = scene();
+        // scene() points at paths that do not exist, so no backup does either.
+        app.undo("codex");
+
+        assert_eq!(app.status.tone, Tone::Info, "a missing backup reported as a failure");
+        assert!(app.status.text.contains("nothing to undo"), "{:?}", app.status.text);
+    }
+
+    #[test]
+    fn visual_outranks_editor_and_neither_may_be_blank() {
+        let some = |text: &str| Some(text.to_string());
+        assert_eq!(editor_for([some("hx"), some("vim")]), "hx");
+        assert_eq!(editor_for([None, some("vim")]), "vim");
+        // A variable set to nothing is not a choice of editor.
+        assert_eq!(editor_for([some("  "), some("vim")]), "vim");
+
+        let fallback = editor_for([None, None]);
+        assert_eq!(fallback, if cfg!(windows) { "notepad" } else { "vi" });
+        assert!(!fallback.is_empty(), "the fallback must be launchable");
+    }
+
+    #[test]
+    fn a_config_that_came_back_broken_outranks_how_the_editor_exited() {
+        let broken = Some("expected `=` at line 4");
+
+        // Even a clean exit is bad news if what it wrote will not parse.
+        let (tone, said) = edit_outcome(&Edited::Saved, broken, "/c.toml");
+        assert_eq!(tone, Tone::Bad);
+        assert!(said.contains("no longer parses") && said.contains("line 4"), "{said}");
+
+        let (tone, said) = edit_outcome(&Edited::Saved, None, "/c.toml");
+        assert_eq!(tone, Tone::Good);
+        assert!(said.contains("still parses"), "{said}");
+    }
+
+    #[test]
+    fn an_editor_that_exited_badly_still_had_its_work_re_read() {
+        let (tone, said) = edit_outcome(&Edited::Rejected("vi exited with 1".into()), None, "/c");
+        assert_eq!(tone, Tone::Info, "a non-zero exit is not this program's failure");
+        assert!(said.contains("re-read"), "the reload is not reported: {said}");
+
+        // Nothing ran, so there is nothing to say about the file.
+        let (tone, said) = edit_outcome(&Edited::Failed("could not launch hx".into()), None, "/c");
+        assert_eq!(tone, Tone::Bad);
+        assert_eq!(said, "could not launch hx");
+    }
+
+    #[test]
+    fn editing_the_config_is_announced_before_the_terminal_is_handed_over() {
+        let mut app = scene();
+        app.dispatch(Action::EditConfig);
+
+        assert!(matches!(app.pending, Some(Job::EditConfig)), "not scheduled as a job");
+        assert!(app.status.text.contains("$EDITOR"), "unannounced: {:?}", app.status.text);
+    }
+
+    /// Registry entries of every shape the picker has to draw.
+    fn registry_entries() -> Vec<registry::Entry> {
+        vec![
+            registry::Entry {
+                name: "io.github.example/filesystem".into(),
+                title: Some("Filesystem".into()),
+                description: "Read and write files".into(),
+                version: Some("1.2.0".into()),
+                options: vec![registry::Launch::Package {
+                    runtime: "npx".into(),
+                    args: vec!["-y".into(), "server-filesystem@0.1.2".into()],
+                    env: vec![
+                        registry::EnvVar {
+                            name: "CONFAI_TEST_ROOT".into(),
+                            description: Some("Where to serve from".into()),
+                            required: true,
+                            secret: false,
+                        },
+                        registry::EnvVar {
+                            name: "CONFAI_TEST_TOKEN".into(),
+                            description: None,
+                            required: true,
+                            secret: true,
+                        },
+                    ],
+                }],
+            },
+            registry::Entry {
+                name: "ac.example/hosted".into(),
+                title: None,
+                description: "Hosted".into(),
+                version: None,
+                options: vec![registry::Launch::Remote {
+                    url: "https://mcp.example.invalid/mcp".into(),
+                }],
+            },
+            registry::Entry {
+                name: "com.example/container".into(),
+                title: None,
+                description: "Container only".into(),
+                version: None,
+                options: Vec::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_registry_row_says_how_the_server_would_be_started() {
+        let entries = registry_entries();
+        assert_eq!(launch_summary(&entries[0]), "npx -y server-filesystem@0.1.2");
+        assert_eq!(launch_summary(&entries[1]), "https://mcp.example.invalid/mcp");
+        // Nothing this program can start, and the row says so rather than lying.
+        assert_eq!(launch_summary(&entries[2]), "nothing installable");
+    }
+
+    #[test]
+    fn the_variables_an_entry_needs_are_reported_with_secrets_marked() {
+        // Neither is set in the test process, and both are required.
+        let missing = missing_env_of(&registry_entries()[0]);
+        assert_eq!(missing, ["$CONFAI_TEST_ROOT", "$CONFAI_TEST_TOKEN (a secret)"]);
+
+        // A remote server asks for nothing.
+        assert!(missing_env_of(&registry_entries()[1]).is_empty());
+    }
+
+    #[test]
+    fn typing_in_the_registry_picker_filters_what_was_already_fetched() {
+        let mut picker = RegistryPicker::new(String::new(), registry_entries());
+        assert_eq!(picker.matches.len(), 3);
+
+        picker.query.push_str("hosted");
+        picker.rebuild();
+        assert_eq!(picker.matches.len(), 1);
+        assert_eq!(picker.selected().map(|entry| entry.name.as_str()), Some("ac.example/hosted"));
+
+        picker.query.push_str("-no-such-thing");
+        picker.rebuild();
+        assert!(picker.matches.is_empty());
+        assert!(picker.selected().is_none(), "a cursor left pointing at a gone row");
+    }
+
+    #[test]
+    fn the_registry_search_is_announced_before_it_reaches_the_network() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        app.dispatch(Action::Registry);
+
+        let Some(Job::Registry(query)) = &app.pending else {
+            panic!("the registry search was not scheduled as a job: {:?}", app.pending)
+        };
+        assert!(query.is_empty(), "the first search lists whatever the registry returns first");
+        assert!(app.status.text.contains("registry"), "unannounced: {:?}", app.status.text);
+    }
+
+    #[test]
+    fn an_agent_that_stores_no_mcp_servers_is_not_offered_the_registry() {
+        let mut app = scene();
+        app.agents[0].capabilities.mcp = false;
+
+        let refusal = Action::Registry.unavailable(&app).expect("the registry was offered anyway");
+        assert!(refusal.contains("does not store MCP servers"), "{refusal}");
+    }
+
+    #[test]
+    fn an_install_warns_about_the_variables_it_could_not_set() {
+        let missing = missing_env_of(&registry_entries()[0]);
+        let note =
+            missing_note("filesystem", &missing).expect("no warning for a server needing two");
+
+        assert!(note.starts_with("added filesystem"), "{note}");
+        assert!(note.contains("$CONFAI_TEST_ROOT"), "{note}");
+        // A credential is called out as one: the registry knows, the user acts.
+        assert!(note.contains("$CONFAI_TEST_TOKEN (a secret)"), "{note}");
+
+        // A server that needs nothing is not worth a line about it.
+        assert_eq!(missing_note("hosted", &[]), None);
+    }
+
+    #[test]
+    fn an_entry_with_nothing_runnable_never_reaches_the_config() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        // Refused before any write is attempted, so this touches no config.
+        app.install_registry(&registry_entries()[2]);
+
+        assert_eq!(app.status.tone, Tone::Bad);
+        assert!(app.status.text.contains("lists no way to run it"), "{:?}", app.status.text);
+    }
+
+    #[test]
+    fn the_registry_picker_draws_its_rows_and_offers_the_way_back_out() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        app.overlay =
+            Some(Overlay::Registry(RegistryPicker::new(String::new(), registry_entries())));
+
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("mcp registry"), "no title:\n{text}");
+        assert!(text.contains("io.github.example/filesystem"), "no rows:\n{text}");
+        // Truncated to its column, so match the head of it rather than the whole.
+        assert!(text.contains("npx -y server-filesyste"), "no launch summary:\n{text}");
+        assert!(text.contains("nothing installable"), "an unrunnable entry is unmarked:\n{text}");
+        // Both jobs of the query line are on screen, since one of them costs a
+        // request and the user has to know which.
+        assert!(text.contains("ctrl+r search registry"), "no way to re-query:\n{text}");
+        assert!(text.contains("enter install"), "no way to install:\n{text}");
+    }
+
+    #[test]
+    fn everything_the_cli_can_do_is_reachable_from_the_palette() {
+        let app = scene();
+        let catalogue = Action::catalogue(&app);
+
+        // The five the CLI had and this view did not.
+        for action in
+            [Action::Registry, Action::Undo, Action::Doctor, Action::Update, Action::EditConfig]
+        {
+            assert!(
+                catalogue.contains(&action),
+                "{:?} cannot be found by searching for it",
+                action.label()
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_screen_lists_an_action_that_has_no_key_of_its_own() {
+        let mut app = scene();
+        app.dispatch(Action::Help);
+        let text = screen(&mut app, 100, 60);
+
+        // Every new action is on the one complete map of what the program does.
+        for expected in ["$EDITOR", "restore this agent's config", "check every config parses"] {
+            assert!(text.contains(expected), "{expected:?} missing from the help:\n{text}");
+        }
+        // Reachable without a binding, and said so rather than left out.
+        assert!(text.contains("(commands)"), "a keyless action was dropped:\n{text}");
+        assert!(text.contains("newer release"), "update missing from the help:\n{text}");
+    }
+
+    #[test]
+    fn the_registry_is_offered_only_where_mcp_servers_live() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        app.focus = Pane::Providers;
+        let mcp = screen(&mut app, 150, 30);
+        assert!(mcp.contains("g registry"), "no registry hint on the mcp lens:\n{mcp}");
+
+        app.lens = Lens::Providers;
+        let providers = screen(&mut app, 150, 30);
+        assert!(!providers.contains("g registry"), "registry offered on providers:\n{providers}");
     }
 
     /// The skills pane, on the agent that has any.
