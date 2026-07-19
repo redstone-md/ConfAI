@@ -558,6 +558,8 @@ enum Action {
     Update,
     /// Put back the config as it was before this program last wrote to it.
     Undo,
+    /// Open the selected agent's config file in `$EDITOR`.
+    EditConfig,
     Palette,
     Help,
     Quit,
@@ -580,6 +582,7 @@ fn menu() -> Vec<Action> {
         Action::Preset(None),
         Action::Lens(None),
         Action::Reload,
+        Action::EditConfig,
         Action::Doctor,
         Action::Update,
         Action::Undo,
@@ -650,6 +653,7 @@ impl Action {
             Action::Doctor => "doctor".into(),
             Action::Update => "check for updates".into(),
             Action::Undo => "undo the last change".into(),
+            Action::EditConfig => "edit config in $EDITOR".into(),
             Action::Palette => "command palette".into(),
             Action::Help => "help".into(),
             Action::Quit => "quit".into(),
@@ -688,6 +692,7 @@ impl Action {
             Action::Doctor => "doctor",
             Action::Update => "update",
             Action::Undo => "undo",
+            Action::EditConfig => "editor",
             Action::Palette => "commands",
             Action::Help => "help",
             Action::Quit => "quit",
@@ -738,6 +743,9 @@ impl Action {
             Action::Undo => {
                 "restore this agent's config from the backup taken before the last write".into()
             }
+            Action::EditConfig => {
+                "open this agent's config file in $EDITOR and re-read it afterwards".into()
+            }
             Action::Palette => "search every action by name".into(),
             Action::Help => "the about screen and the full key map".into(),
             Action::Quit => format!("leave {}", brand::NAME),
@@ -780,6 +788,7 @@ impl Action {
             // finger beside the keys that edit a config.
             Action::Update => return None,
             Action::Undo => "U",
+            Action::EditConfig => "E",
             Action::Palette => "ctrl+p or ctrl+k",
             Action::Help => "?",
             Action::Quit => "q",
@@ -829,7 +838,11 @@ impl Action {
             | Action::Doctor
             | Action::Update => None,
             Action::SelectAgent(_) => None,
-            Action::Add | Action::Preset(_) | Action::Use(Some(_)) | Action::Undo => no_agent(),
+            Action::Add
+            | Action::Preset(_)
+            | Action::Use(Some(_))
+            | Action::Undo
+            | Action::EditConfig => no_agent(),
             // Enter on the agent pane only moves the focus, so it is always fine.
             Action::Detail if app.focus == Pane::Agents => None,
             // Deliberately not gated on `per_provider_models`: that flag means
@@ -933,6 +946,7 @@ impl Action {
             Action::Doctor => app.open_doctor(),
             Action::Update => app.schedule(Job::Update, "asking about the latest release…"),
             Action::Undo => app.ask_undo(),
+            Action::EditConfig => app.schedule(Job::EditConfig, "handing the config to $EDITOR…"),
             Action::Palette => app.open_palette(),
             Action::Help => app.overlay = Some(Overlay::About { scroll: 0 }),
             Action::Quit => app.quit = true,
@@ -1485,6 +1499,47 @@ fn update_report(status: &crate::update::Status) -> Report {
     report
 }
 
+/// Which editor to hand a config to.
+///
+/// `VISUAL` wins over `EDITOR`, as it does everywhere else, and either being set
+/// to nothing falls through to the next candidate rather than trying to launch
+/// an empty command. The last resort is the one editor the platform is sure to
+/// have.
+fn editor_for(candidates: [Option<String>; 2]) -> String {
+    candidates.into_iter().flatten().find(|name| !name.trim().is_empty()).unwrap_or_else(|| {
+        if cfg!(windows) {
+            "notepad".into()
+        } else {
+            "vi".into()
+        }
+    })
+}
+
+/// How an editor run ended, in the terms the status line cares about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Edited {
+    Saved,
+    /// It ran and exited non-zero. The config is re-read anyway: an editor can
+    /// write a file and still fail on its way out.
+    Rejected(String),
+    /// It could not be started at all, so nothing was touched.
+    Failed(String),
+}
+
+/// What to say once the editor has gone. `problem` is what the config came back
+/// as, when it came back unparseable.
+///
+/// A config that no longer parses outranks how the editor exited: a clean exit
+/// over a broken file is the case the user most needs told about.
+fn edit_outcome(ended: &Edited, problem: Option<&str>, path: &str) -> (Tone, String) {
+    match (ended, problem) {
+        (Edited::Failed(err), _) => (Tone::Bad, err.clone()),
+        (_, Some(problem)) => (Tone::Bad, format!("{path} no longer parses: {problem}")),
+        (Edited::Saved, None) => (Tone::Good, format!("{path} still parses")),
+        (Edited::Rejected(how), None) => (Tone::Info, format!("{how}; re-read {path} anyway")),
+    }
+}
+
 /// The command palette: a query and the actions it still matches.
 struct CommandPalette {
     query: String,
@@ -1652,6 +1707,9 @@ enum Job {
     /// Ask GitHub for the latest release, rather than waiting for the notice the
     /// next start would show.
     Update,
+    /// Hand the selected agent's config to `$EDITOR`, which needs the terminal
+    /// this program is drawing on.
+    EditConfig,
 }
 
 /// Where a list was last drawn and how far it had scrolled, so a click can be
@@ -2015,6 +2073,7 @@ impl App {
             KeyCode::Char('r') => self.dispatch(Action::Reload),
             KeyCode::Char('D') => self.dispatch(Action::Doctor),
             KeyCode::Char('U') => self.dispatch(Action::Undo),
+            KeyCode::Char('E') => self.dispatch(Action::EditConfig),
             _ => {}
         }
     }
@@ -2236,7 +2295,48 @@ impl App {
             Job::McpCheckAll => self.mcp_check_all(terminal),
             Job::Sync { prune } => self.sync_selected(prune),
             Job::Update => self.check_update(),
+            Job::EditConfig => self.edit_config(terminal),
         }
+    }
+
+    /// Open the selected agent's config in `$EDITOR`, then re-read it.
+    ///
+    /// The editor owns the terminal while it runs, so this leaves the alternate
+    /// screen and stops reporting the mouse before spawning it: an editor drawn
+    /// into a screen this program still owns is unreadable, and its clicks would
+    /// arrive here as key sequences. Both are put back afterwards however the
+    /// editor exited.
+    fn edit_config(&mut self, terminal: &mut DefaultTerminal) {
+        let Some(path) = self.agent().map(|agent| agent.config_path.clone()) else { return };
+        let editor = editor_for([std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok()]);
+
+        let _ = ratatui::try_restore();
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+
+        let ended = match std::process::Command::new(&editor).arg(&path).status() {
+            Ok(status) if status.success() => Edited::Saved,
+            Ok(status) => Edited::Rejected(format!("{editor} exited with {status}")),
+            Err(err) => Edited::Failed(format!("could not launch {editor}: {err}")),
+        };
+
+        let _ = execute!(io::stdout(), EnableMouseCapture);
+        match ratatui::try_init() {
+            Ok(fresh) => *terminal = fresh,
+            // Without a screen there is nothing left to draw on, so leave rather
+            // than spin in a loop that cannot render.
+            Err(err) => {
+                self.say(Tone::Bad, format!("could not take the terminal back: {err}"));
+                self.quit = true;
+                return;
+            }
+        }
+        let _ = terminal.clear();
+
+        // Re-read regardless: an editor that exited badly may still have written.
+        self.refresh_selected();
+        let problem = self.agent().and_then(|agent| agent.error.clone());
+        let (tone, said) = edit_outcome(&ended, problem.as_deref(), &path.display().to_string());
+        self.say(tone, said);
     }
 
     /// Check for a new release now and report what came back.
@@ -3413,6 +3513,7 @@ impl App {
                     // whole, rather than to a row of the list beside it.
                     (Pane::Agents, _) => Hint::bar([
                         Action::Lens(None),
+                        Action::EditConfig,
                         Action::Undo,
                         Action::Doctor,
                         Action::Palette,
@@ -5382,6 +5483,54 @@ mod render_tests {
 
         assert_eq!(app.status.tone, Tone::Info, "a missing backup reported as a failure");
         assert!(app.status.text.contains("nothing to undo"), "{:?}", app.status.text);
+    }
+
+    #[test]
+    fn visual_outranks_editor_and_neither_may_be_blank() {
+        let some = |text: &str| Some(text.to_string());
+        assert_eq!(editor_for([some("hx"), some("vim")]), "hx");
+        assert_eq!(editor_for([None, some("vim")]), "vim");
+        // A variable set to nothing is not a choice of editor.
+        assert_eq!(editor_for([some("  "), some("vim")]), "vim");
+
+        let fallback = editor_for([None, None]);
+        assert_eq!(fallback, if cfg!(windows) { "notepad" } else { "vi" });
+        assert!(!fallback.is_empty(), "the fallback must be launchable");
+    }
+
+    #[test]
+    fn a_config_that_came_back_broken_outranks_how_the_editor_exited() {
+        let broken = Some("expected `=` at line 4");
+
+        // Even a clean exit is bad news if what it wrote will not parse.
+        let (tone, said) = edit_outcome(&Edited::Saved, broken, "/c.toml");
+        assert_eq!(tone, Tone::Bad);
+        assert!(said.contains("no longer parses") && said.contains("line 4"), "{said}");
+
+        let (tone, said) = edit_outcome(&Edited::Saved, None, "/c.toml");
+        assert_eq!(tone, Tone::Good);
+        assert!(said.contains("still parses"), "{said}");
+    }
+
+    #[test]
+    fn an_editor_that_exited_badly_still_had_its_work_re_read() {
+        let (tone, said) = edit_outcome(&Edited::Rejected("vi exited with 1".into()), None, "/c");
+        assert_eq!(tone, Tone::Info, "a non-zero exit is not this program's failure");
+        assert!(said.contains("re-read"), "the reload is not reported: {said}");
+
+        // Nothing ran, so there is nothing to say about the file.
+        let (tone, said) = edit_outcome(&Edited::Failed("could not launch hx".into()), None, "/c");
+        assert_eq!(tone, Tone::Bad);
+        assert_eq!(said, "could not launch hx");
+    }
+
+    #[test]
+    fn editing_the_config_is_announced_before_the_terminal_is_handed_over() {
+        let mut app = scene();
+        app.dispatch(Action::EditConfig);
+
+        assert!(matches!(app.pending, Some(Job::EditConfig)), "not scheduled as a job");
+        assert!(app.status.text.contains("$EDITOR"), "unannounced: {:?}", app.status.text);
     }
 
     /// The skills pane, on the agent that has any.
