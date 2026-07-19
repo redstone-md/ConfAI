@@ -706,6 +706,10 @@ fn mcp_command(command: McpCommand) -> Result<()> {
         }
         McpCommand::Remove { name, target } => mcp_remove(&name, &target),
         McpCommand::Toggle { name, off, target } => mcp_toggle(&name, !off, &target),
+        McpCommand::Search { query, limit } => mcp_search(&query, limit),
+        McpCommand::Install { name, target, r#as } => {
+            mcp_install(&name, &target, r#as.as_deref())
+        }
         McpCommand::Preset(McpPresetCommand::List) => mcp_preset_list(),
         McpCommand::Preset(McpPresetCommand::Apply { id, target, name }) => {
             mcp_preset_apply(&id, &target, name.as_deref())
@@ -918,6 +922,76 @@ fn mcp_toggle(name: &str, enabled: bool, target: &Target) -> Result<()> {
 
     if !changed {
         bail!("no selected agent could toggle an MCP server called {name:?}");
+    }
+    Ok(())
+}
+
+fn mcp_search(query: &str, limit: usize) -> Result<()> {
+    let entries = net::registry::search(query, limit)?;
+    if entries.is_empty() {
+        println!("{}", ui::dim("the registry returned nothing for that"));
+        return Ok(());
+    }
+
+    let mut table = Table::new(["name", "runs as", "description"]);
+    for entry in &entries {
+        let runs = match entry.preferred() {
+            Some(net::registry::Launch::Package { runtime, args, .. }) => {
+                ui::truncate(&format!("{runtime} {}", args.join(" ")), 38)
+            }
+            Some(net::registry::Launch::Remote { url }) => ui::truncate(url, 38),
+            None => ui::dim("nothing installable"),
+        };
+        table.row([
+            ui::truncate(&entry.name, 40),
+            runs,
+            ui::truncate(&entry.description, 52),
+        ]);
+    }
+    print!("{}", table.render());
+    println!(
+        "\n{}",
+        ui::dim(&format!(
+            "{} server(s); install one with `confai mcp install <name>`",
+            entries.len()
+        ))
+    );
+    Ok(())
+}
+
+fn mcp_install(name: &str, target: &Target, rename: Option<&str>) -> Result<()> {
+    let entry = net::registry::get(name)?;
+    let server = entry.to_server(rename)?;
+
+    // The registry names the variables a server needs; it cannot know their
+    // values. Saying which ones are missing is the difference between a server
+    // that works and one that fails on its first call.
+    for var in entry.missing_env() {
+        let note = var.description.as_deref().unwrap_or("required");
+        println!(
+            "{} set ${} before using this — {}{}",
+            ui::yellow("!"),
+            var.name,
+            note,
+            if var.secret { ui::dim(" (a secret)") } else { String::new() }
+        );
+    }
+
+    let agents = if target.all { mcp_agents(target)? } else { vec![resolve_one(target)?] };
+    for agent_entry in agents {
+        if !agent_entry.info().capabilities.mcp {
+            bail!("{} does not store MCP servers", agent_entry.info().name);
+        }
+        let mut config = agent_entry.load()?;
+        config.upsert_mcp(&server)?;
+        config.save()?;
+        println!(
+            "{} added {} to {} as {}",
+            ui::green("✓"),
+            ui::bold(&entry.name),
+            agent_entry.info().name,
+            server.name
+        );
     }
     Ok(())
 }

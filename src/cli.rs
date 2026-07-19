@@ -286,6 +286,27 @@ pub enum McpCommand {
         target: Target,
     },
 
+    /// Search the official MCP registry.
+    Search {
+        /// What to look for. Omit to list whatever the registry returns first.
+        #[arg(default_value = "")]
+        query: String,
+        /// How many results to ask the registry for before de-duplication.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
+    /// Install a server from the official MCP registry by its registry name.
+    Install {
+        /// Registry name, as printed by `mcp search`.
+        name: String,
+        #[command(flatten)]
+        target: Target,
+        /// Record it under this name instead of the one derived from the registry.
+        #[arg(long)]
+        r#as: Option<String>,
+    },
+
     /// Recipes for well-known MCP servers.
     #[command(subcommand)]
     Preset(McpPresetCommand),

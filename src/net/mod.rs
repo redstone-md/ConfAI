@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod probe;
+pub mod registry;
 
 use std::time::Duration;
 
