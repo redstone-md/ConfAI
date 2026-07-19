@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/redstone-md/ConfAI/releases/tag/v0.0.4) - 2026-07-19
+
+### Features
+
+- The last four things only the command line could do ([`764d89c`](https://github.com/redstone-md/ConfAI/commit/764d89c85eb17eefba96c92cc61aeccc28353bf9))
+- Write a preset, a server or an undo into every agent at once ([`96767ac`](https://github.com/redstone-md/ConfAI/commit/96767ac56b157841955a8941a1aab532bd1a714e))
+- Refresh the model catalogue, and preview a sync before running it ([`552d832`](https://github.com/redstone-md/ConfAI/commit/552d8327b55c49f6d1ddcc25831aff0fa85298f1))
+- The preset picker shows the card, not just the row ([`9705416`](https://github.com/redstone-md/ConfAI/commit/9705416f74305c56c66858b0bf9fb3572c65865b))
+- Name the upgrade commands in the update report ([`2223c60`](https://github.com/redstone-md/ConfAI/commit/2223c608d6e8afcfe4f0307d87708f472d782b84))
+- Close the CLI/TUI capability gap ([`8ecbb97`](https://github.com/redstone-md/ConfAI/commit/8ecbb9768e558494eb1c24581be9edd5b3f9a88e))
+- List the keyless actions in the help screen too ([`392ec09`](https://github.com/redstone-md/ConfAI/commit/392ec094f94c0cceb8211879600a714cfb25f043))
+- Search and install MCP servers from the registry, in the MCP lens ([`bf54eca`](https://github.com/redstone-md/ConfAI/commit/bf54eca3123443e930d4a5e6bb64c1a7c8d9cbd9))
+- Open an agent's config in $EDITOR without leaving the view ([`2c073b1`](https://github.com/redstone-md/ConfAI/commit/2c073b1e767b3d65bdcc3c76c755dd7918514796))
+- Undo the last write, from the interface that made it ([`c7b32c7`](https://github.com/redstone-md/ConfAI/commit/c7b32c76f846f2327c2ada1051a8d6b59d0b08cf))
+- Check for a new release on demand ([`cf97a58`](https://github.com/redstone-md/ConfAI/commit/cf97a581b9d60d9c52588d9472393eeda192cb95))
+- Doctor, as a report you can read in the interface ([`e520d6b`](https://github.com/redstone-md/ConfAI/commit/e520d6b6f2cdd1baadce98c9d7a494977f2b9993))
+- The lens is a row of clickable tabs ([`5e80179`](https://github.com/redstone-md/ConfAI/commit/5e80179cb041558e72b98131defe34c9ad12ea4e))
+- Search and install MCP servers from the official registry ([`bc03052`](https://github.com/redstone-md/ConfAI/commit/bc03052e4ec1ee215a60d71a4c05f11dc154666c))
+
+### Fixes
+
+- Changing an opencode provider's wire protocol had no effect ([`f2b2d28`](https://github.com/redstone-md/ConfAI/commit/f2b2d28d7968d7632ee8f28b75e3300fae71719e))
+- Keep the agent worktree out of the repository ([`f7e5909`](https://github.com/redstone-md/ConfAI/commit/f7e59096ba33766019d360243d97f04d1349e9f5))
+- Make a test unable to write to a real config ([`1864ec2`](https://github.com/redstone-md/ConfAI/commit/1864ec2b1986584409fefb9487f17436ecfde704))
+
+### Other
+
+- Format the registry command bodies ([`2eced11`](https://github.com/redstone-md/ConfAI/commit/2eced1132545e66bbdb1d68c5623f0fabafc89d9))
+
+Full changelog: [v0.0.3...v0.0.4](https://github.com/redstone-md/ConfAI/compare/v0.0.3...v0.0.4)
+
+
+
 ## [0.0.3](https://github.com/redstone-md/ConfAI/releases/tag/v0.0.3) - 2026-07-19
 
 ### Features
