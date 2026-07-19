@@ -707,9 +707,7 @@ fn mcp_command(command: McpCommand) -> Result<()> {
         McpCommand::Remove { name, target } => mcp_remove(&name, &target),
         McpCommand::Toggle { name, off, target } => mcp_toggle(&name, !off, &target),
         McpCommand::Search { query, limit } => mcp_search(&query, limit),
-        McpCommand::Install { name, target, r#as } => {
-            mcp_install(&name, &target, r#as.as_deref())
-        }
+        McpCommand::Install { name, target, r#as } => mcp_install(&name, &target, r#as.as_deref()),
         McpCommand::Preset(McpPresetCommand::List) => mcp_preset_list(),
         McpCommand::Preset(McpPresetCommand::Apply { id, target, name }) => {
             mcp_preset_apply(&id, &target, name.as_deref())
@@ -942,11 +940,7 @@ fn mcp_search(query: &str, limit: usize) -> Result<()> {
             Some(net::registry::Launch::Remote { url }) => ui::truncate(url, 38),
             None => ui::dim("nothing installable"),
         };
-        table.row([
-            ui::truncate(&entry.name, 40),
-            runs,
-            ui::truncate(&entry.description, 52),
-        ]);
+        table.row([ui::truncate(&entry.name, 40), runs, ui::truncate(&entry.description, 52)]);
     }
     print!("{}", table.render());
     println!(
