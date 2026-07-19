@@ -219,6 +219,8 @@ impl Pane {
 enum Tone {
     Info,
     Good,
+    /// Works, but wants attention: the report equivalent of the CLI's yellow `!`.
+    Warn,
     Bad,
 }
 
@@ -227,6 +229,7 @@ impl Tone {
         Style::default().fg(match self {
             Tone::Info => palette::MUTED,
             Tone::Good => palette::GOOD,
+            Tone::Warn => palette::WARN,
             Tone::Bad => palette::BAD,
         })
     }
@@ -235,6 +238,7 @@ impl Tone {
         match self {
             Tone::Info => "·",
             Tone::Good => "✓",
+            Tone::Warn => "!",
             Tone::Bad => "✗",
         }
     }
@@ -547,6 +551,8 @@ enum Action {
     /// Copy the selected skill into another agent's skills directory.
     SkillCopy,
     Reload,
+    /// Check every config, provider and selection, and report what is wrong.
+    Doctor,
     Palette,
     Help,
     Quit,
@@ -569,6 +575,7 @@ fn menu() -> Vec<Action> {
         Action::Preset(None),
         Action::Lens(None),
         Action::Reload,
+        Action::Doctor,
         Action::Palette,
         Action::Help,
         Action::Quit,
@@ -633,6 +640,7 @@ impl Action {
             Action::SkillDelete => "delete skill".into(),
             Action::SkillCopy => "copy skill to another agent".into(),
             Action::Reload => "reload from disk".into(),
+            Action::Doctor => "doctor".into(),
             Action::Palette => "command palette".into(),
             Action::Help => "help".into(),
             Action::Quit => "quit".into(),
@@ -668,6 +676,7 @@ impl Action {
             Action::SkillDelete => "del",
             Action::SkillCopy => "copy",
             Action::Reload => "reload",
+            Action::Doctor => "doctor",
             Action::Palette => "commands",
             Action::Help => "help",
             Action::Quit => "quit",
@@ -713,6 +722,7 @@ impl Action {
             }
             Action::SkillCopy => "copy this skill into another agent's skills directory".into(),
             Action::Reload => "re-read every config from disk".into(),
+            Action::Doctor => "check every config parses and every selected provider exists".into(),
             Action::Palette => "search every action by name".into(),
             Action::Help => "the about screen and the full key map".into(),
             Action::Quit => format!("leave {}", brand::NAME),
@@ -749,6 +759,7 @@ impl Action {
             Action::SkillDelete => "d",
             Action::SkillCopy => "y",
             Action::Reload => "r",
+            Action::Doctor => "D",
             Action::Palette => "ctrl+p or ctrl+k",
             Action::Help => "?",
             Action::Quit => "q",
@@ -788,7 +799,14 @@ impl Action {
         };
 
         match self {
-            Action::Quit | Action::Help | Action::Reload | Action::Palette | Action::Filter => None,
+            // Whole-program checks; they need no agent and never fail to have
+            // something to say.
+            Action::Quit
+            | Action::Help
+            | Action::Reload
+            | Action::Palette
+            | Action::Filter
+            | Action::Doctor => None,
             Action::SelectAgent(_) => None,
             Action::Add | Action::Preset(_) | Action::Use(Some(_)) => no_agent(),
             // Enter on the agent pane only moves the focus, so it is always fine.
@@ -891,6 +909,7 @@ impl Action {
                 app.reload();
                 app.say(Tone::Info, "reloaded from disk");
             }
+            Action::Doctor => app.open_doctor(),
             Action::Palette => app.open_palette(),
             Action::Help => app.overlay = Some(Overlay::About { scroll: 0 }),
             Action::Quit => app.quit = true,
@@ -1310,6 +1329,105 @@ struct Detail {
     catalog: Option<catalog::Catalog>,
 }
 
+/// A read-only, scrolling report.
+///
+/// `doctor` and `update` both answer with a handful of findings rather than a
+/// list of things to pick from — nothing here selects, filters or applies — so
+/// they share one overlay instead of growing a pane each.
+#[derive(Debug, Clone, Default)]
+struct Report {
+    title: String,
+    lines: Vec<ReportLine>,
+    scroll: u16,
+    /// Findings that are wrong rather than merely worth knowing, counted before
+    /// the closing summary joins the list so it cannot count itself.
+    problems: usize,
+}
+
+/// One finding. Nested lines belong to the heading above them.
+#[derive(Debug, Clone)]
+struct ReportLine {
+    tone: Tone,
+    text: String,
+    nested: bool,
+}
+
+impl Report {
+    fn new(title: impl Into<String>) -> Self {
+        Self { title: title.into(), lines: Vec::new(), scroll: 0, problems: 0 }
+    }
+
+    fn line(&mut self, tone: Tone, text: impl Into<String>) {
+        self.lines.push(ReportLine { tone, text: text.into(), nested: false });
+    }
+
+    /// A finding about something the line above it named.
+    fn nested(&mut self, tone: Tone, text: impl Into<String>) {
+        self.lines.push(ReportLine { tone, text: text.into(), nested: true });
+    }
+
+    fn blank(&mut self) {
+        self.line(Tone::Info, "");
+    }
+
+    /// Close the report with a count of what is wrong, and remember it.
+    fn summarise(&mut self, none: &str) {
+        self.problems = self.lines.iter().filter(|line| line.tone == Tone::Bad).count();
+        self.blank();
+        match self.problems {
+            0 => self.line(Tone::Good, none),
+            count => self.line(Tone::Bad, format!("{count} problem(s) found")),
+        }
+    }
+}
+
+/// The whole-program check: every config parses, every referenced provider
+/// resolves, every endpoint has somewhere to call.
+///
+/// Reads the snapshots the app already holds rather than the disk, so it reports
+/// exactly what the panes are showing and needs no job to run.
+fn doctor(agents: &[AgentEntry]) -> Report {
+    let mut report = Report::new("doctor");
+
+    for agent in agents {
+        if !agent.detection.installed() {
+            report.line(Tone::Info, format!("{} not installed", agent.name));
+            continue;
+        }
+        if let Some(err) = &agent.error {
+            report.line(Tone::Bad, format!("{}: {err}", agent.name));
+            continue;
+        }
+
+        report.line(Tone::Good, format!("{} parses ({})", agent.name, agent.config_path.display()));
+
+        for provider in &agent.providers {
+            // An endpoint with nowhere to call is the one broken provider the
+            // pane cannot show you, because the column is simply blank.
+            if provider.base_url.is_none() {
+                report.nested(Tone::Bad, format!("{} has no base URL", provider.id));
+            }
+            if agent.capabilities.per_provider_models && provider.models.is_empty() {
+                report.nested(
+                    Tone::Warn,
+                    format!("{} lists no models; press s to fill them in", provider.id),
+                );
+            }
+        }
+
+        // The config names a provider that is not in it: the agent will fail at
+        // its next call, and nothing in the provider list looks wrong.
+        if let Some(active) = &agent.active {
+            if !agent.providers.iter().any(|provider| provider.id == *active) {
+                report.nested(Tone::Bad, format!("selected provider {active:?} is not configured"));
+            }
+        }
+    }
+
+    report.summarise("no problems found");
+    report
+}
+
 /// The command palette: a query and the actions it still matches.
 struct CommandPalette {
     query: String,
@@ -1440,17 +1558,25 @@ fn rank_by<T>(items: &[T], query: &str, label: impl Fn(&T) -> String) -> Vec<usi
 }
 
 enum Overlay {
-    About { scroll: u16 },
+    About {
+        scroll: u16,
+    },
     Detail(Detail),
     Form(Form),
     Confirm(Confirm),
     Presets(PresetPicker),
     Palette(CommandPalette),
     Models(ModelPicker),
-    McpDetail { scroll: u16 },
+    McpDetail {
+        scroll: u16,
+    },
     McpPresets(McpPresetPicker),
-    SkillDetail { scroll: u16 },
+    SkillDetail {
+        scroll: u16,
+    },
     SkillCopy(SkillCopyPicker),
+    /// What `doctor` or `update` had to say.
+    Report(Report),
 }
 
 /// Work that must be visibly announced before it blocks the event loop.
@@ -1827,6 +1953,7 @@ impl App {
             // Shift widens the same action, as it does for delete in most file managers.
             KeyCode::Char('S') => self.dispatch(Action::Sync { prune: true }),
             KeyCode::Char('r') => self.dispatch(Action::Reload),
+            KeyCode::Char('D') => self.dispatch(Action::Doctor),
             _ => {}
         }
     }
@@ -1967,6 +2094,7 @@ impl App {
                 Overlay::McpPresets(picker) => picker.cursor.step(delta, picker.presets.len()),
                 Overlay::SkillDetail { scroll } => *scroll = scrolled(*scroll),
                 Overlay::SkillCopy(picker) => picker.cursor.step(delta, picker.targets.len()),
+                Overlay::Report(report) => report.scroll = scrolled(report.scroll),
                 Overlay::Form(_) | Overlay::Confirm(_) => {}
             }
             return;
@@ -2181,6 +2309,23 @@ impl App {
             self.say(Tone::Info, format!("added {name}, but ${} is not set", missing.join(", $")));
         }
         self.select_server(&name);
+    }
+
+    /// Report on the configs as they are currently loaded.
+    ///
+    /// Deliberately does not re-read the disk. Every write this program makes
+    /// refreshes its own snapshot, so the loaded model is current; reporting on
+    /// it means doctor can never contradict the pane beside it, and `r` is there
+    /// for a config that changed under us.
+    fn open_doctor(&mut self) {
+        let report = doctor(&self.agents);
+        let problems = report.problems;
+        self.overlay = Some(Overlay::Report(report));
+        if problems == 0 {
+            self.say(Tone::Good, "doctor found no problems");
+        } else {
+            self.say(Tone::Bad, format!("doctor found {problems} problem(s)"));
+        }
     }
 
     fn open_skill_detail(&mut self) {
@@ -2530,6 +2675,8 @@ impl App {
                 scroll_key(key, scroll).map(|scroll| Overlay::SkillDetail { scroll })
             }
             Overlay::SkillCopy(picker) => self.skill_copy_key(key, picker),
+            Overlay::Report(report) => scroll_key(key, report.scroll)
+                .map(|scroll| Overlay::Report(Report { scroll, ..report })),
         };
         // A handler that opened its own overlay — a form, the preset picker —
         // wins over the one it replaced.
@@ -2977,6 +3124,7 @@ impl App {
                 hits.overlay = Some(area);
                 hits.overlay_rows = rows;
             }
+            Some(Overlay::Report(report)) => hits.overlay = Some(render_report(frame, report)),
             None => {}
         }
         hits
@@ -3085,7 +3233,8 @@ impl App {
             Some(Overlay::About { .. })
             | Some(Overlay::Detail(_))
             | Some(Overlay::McpDetail { .. })
-            | Some(Overlay::SkillDetail { .. }) => {
+            | Some(Overlay::SkillDetail { .. })
+            | Some(Overlay::Report(_)) => {
                 vec![Hint::plain("↑↓", "scroll"), Hint::plain("esc", "close")]
             }
             Some(Overlay::Form(form)) if form.editing => vec![
@@ -3133,8 +3282,11 @@ impl App {
             None => {
                 let mut hints = vec![Hint::plain("↑↓", "move")];
                 hints.extend(match (self.focus, self.lens()) {
+                    // The agent pane's bar carries what applies to the agent as a
+                    // whole, rather than to a row of the list beside it.
                     (Pane::Agents, _) => Hint::bar([
                         Action::Lens(None),
+                        Action::Doctor,
                         Action::Palette,
                         Action::Reload,
                         Action::Help,
@@ -3902,6 +4054,37 @@ fn overlay_frame(frame: &mut Frame, area: Rect, title: &str) -> Rect {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     inner
+}
+
+/// A report as an overlay: one glyph-led line per finding, scrolled like the
+/// other read-only screens.
+fn render_report(frame: &mut Frame, report: &Report) -> Rect {
+    let lines: Vec<Line> = report
+        .lines
+        .iter()
+        .map(|line| {
+            if line.text.is_empty() {
+                return Line::default();
+            }
+            let indent = if line.nested { "    " } else { "  " };
+            Line::from(vec![
+                Span::styled(format!("{indent}{} ", line.tone.glyph()), line.tone.style()),
+                Span::styled(
+                    line.text.clone(),
+                    Style::default().fg(if line.nested { palette::MUTED } else { palette::TEXT }),
+                ),
+            ])
+        })
+        .collect();
+
+    let area = centered(frame.area(), 74, 80);
+    let inner = overlay_frame(frame, area, &report.title);
+    // Wrapped, because a parse error arrives as a sentence rather than a column.
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((report.scroll, 0)),
+        inner,
+    );
+    area
 }
 
 fn render_about(frame: &mut Frame, scroll: u16) -> Rect {
@@ -4899,6 +5082,92 @@ mod render_tests {
         let title: String = runs.iter().map(|(text, ..)| text.as_str()).collect();
         assert_eq!(title.matches(TAB_SEPARATOR.trim()).count(), 1, "not two tabs: {title:?}");
         assert!(!title.contains("skills"), "a lens Codex does not have: {title:?}");
+    }
+
+    /// Every finding of a report, glyph and all, as one searchable string.
+    fn findings(report: &Report) -> String {
+        report
+            .lines
+            .iter()
+            .map(|line| format!("{} {}", line.tone.glyph(), line.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn doctor_passes_a_scene_where_nothing_is_wrong() {
+        let report = doctor(&scene().agents);
+        assert_eq!(report.problems, 0, "clean scene reported problems:\n{}", findings(&report));
+        assert!(findings(&report).contains("no problems found"));
+        // Both agents are accounted for, not just the one under the cursor.
+        assert!(findings(&report).contains("Codex parses"), "{}", findings(&report));
+        assert!(findings(&report).contains("opencode parses"), "{}", findings(&report));
+    }
+
+    #[test]
+    fn doctor_reports_a_selected_provider_that_is_not_configured() {
+        let mut app = scene();
+        app.agents[0].active = Some("ghost".into());
+
+        let report = doctor(&app.agents);
+        assert_eq!(report.problems, 1, "{}", findings(&report));
+        assert!(findings(&report).contains("\"ghost\" is not configured"), "{}", findings(&report));
+        assert!(findings(&report).contains("1 problem(s) found"));
+    }
+
+    #[test]
+    fn doctor_separates_what_is_broken_from_what_merely_wants_attention() {
+        let mut app = scene();
+        // No base URL is broken: the endpoint has nowhere to call.
+        app.agents[0].providers[0].base_url = None;
+        // An empty model list is worth saying and is not a fault.
+        app.agents[1].providers.push(Provider::new("modelless"));
+        app.agents[1].providers[0].base_url = Some("https://example.invalid/v1".into());
+
+        let report = doctor(&app.agents);
+        let text = findings(&report);
+        assert_eq!(report.problems, 1, "a warning was counted as a problem:\n{text}");
+        assert!(text.contains("✗ primary has no base URL"), "{text}");
+        assert!(text.contains("! modelless lists no models"), "{text}");
+    }
+
+    #[test]
+    fn doctor_says_which_config_would_not_parse_and_stops_there() {
+        let mut app = scene();
+        app.agents[0].error = Some("expected `=` at line 4".into());
+
+        let report = doctor(&app.agents);
+        let text = findings(&report);
+        assert_eq!(report.problems, 1, "{text}");
+        assert!(text.contains("Codex: expected `=` at line 4"), "{text}");
+        // A config that did not parse has no providers worth checking.
+        assert!(!text.contains("Codex parses"), "{text}");
+        assert!(!text.contains("has no base URL"), "unparsed config still walked:\n{text}");
+    }
+
+    #[test]
+    fn doctor_passes_over_an_agent_that_is_not_installed() {
+        let mut app = scene();
+        app.agents[0].detection = Detection { binary_on_path: false, config_exists: false };
+        app.agents[0].active = Some("ghost".into());
+
+        let report = doctor(&app.agents);
+        let text = findings(&report);
+        // Nothing is wrong with an agent you do not have.
+        assert_eq!(report.problems, 0, "{text}");
+        assert!(text.contains("· Codex not installed"), "{text}");
+    }
+
+    #[test]
+    fn the_doctor_overlay_draws_its_findings_and_says_so_on_the_status_line() {
+        let mut app = scene();
+        app.agents[0].active = Some("ghost".into());
+        app.dispatch(Action::Doctor);
+
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("doctor"), "no report title:\n{text}");
+        assert!(text.contains("is not configured"), "the finding is not on screen:\n{text}");
+        assert!(text.contains("doctor found"), "nothing said on the status line:\n{text}");
     }
 
     /// The skills pane, on the agent that has any.
