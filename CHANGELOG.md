@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/redstone-md/ConfAI/releases/tag/v0.0.5) - 2026-07-19
+
+### Features
+
+- One panel for finding an MCP server ([`ea7632e`](https://github.com/redstone-md/ConfAI/commit/ea7632e0b9383eb2f80aebc226bb205f66aec898))
+- **tui:** One search over the presets and the registry ([`b2efe83`](https://github.com/redstone-md/ConfAI/commit/b2efe8333ef836dc0761820dccacda43d2ab7378))
+
+### Fixes
+
+- Changing an opencode provider's wire protocol had no effect ([`9245f51`](https://github.com/redstone-md/ConfAI/commit/9245f51c8e0a0951f8a0f833c253f4a34a4a9e09))
+
+### Documentation
+
+- The two mcp pickers are one panel on p and g ([`611ca89`](https://github.com/redstone-md/ConfAI/commit/611ca891665c7f31c2fe58c40b598fc6d47b0107))
+
+Full changelog: [v0.0.4...v0.0.5](https://github.com/redstone-md/ConfAI/compare/v0.0.4...v0.0.5)
+
+
+
 ## [0.0.4](https://github.com/redstone-md/ConfAI/releases/tag/v0.0.4) - 2026-07-19
 
 ### Features
