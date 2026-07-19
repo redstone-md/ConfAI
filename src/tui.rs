@@ -90,6 +90,8 @@ const DOT_HOLLOW: &str = "○";
 const DOT_HALF: &str = "◐";
 /// The nothing-recorded placeholder, distinct from a literal empty string.
 const ABSENT: &str = "—";
+/// Marks a row we vouch for, against the many we merely found.
+const STAR: &str = "★";
 /// Between the lens tabs in a pane title. A rule rather than the `·` the rest of
 /// the title joins with, so a tab boundary is not read as part of a name.
 const TAB_SEPARATOR: &str = " │ ";
@@ -100,6 +102,12 @@ const COMPACT_HEIGHT: u16 = 30;
 const TAGLINE_WIDTH: u16 = 100;
 /// The agent pane never grows; the provider pane is the one with columns to fill.
 const AGENT_PANE_WIDTH: u16 = 30;
+
+/// How wide a search panel asks to be when its rows are ids and numbers.
+const SEARCH_WIDTH: u16 = 76;
+/// And when the row ends in a description, which is what you read to choose.
+/// Clamped to the terminal, so this is a ceiling rather than a demand.
+const WIDE_SEARCH_WIDTH: u16 = 120;
 
 /// How many registry records to ask for before de-duplication, matching
 /// `confai mcp search --limit`. The registry publishes one record per published
@@ -550,10 +558,12 @@ enum Action {
     McpCheck,
     McpCheckAll,
     McpToggle,
-    /// Apply a named MCP preset, or `None` to open the picker.
-    McpPreset(Option<String>),
-    /// Search the official MCP registry and install from it.
-    Registry,
+    /// Apply one MCP preset by name. There is no bare form: choosing one is
+    /// what [`Action::McpFind`] is for, and a second door onto the same picker
+    /// is how the registry came to be invisible from inside the preset list.
+    McpPreset(String),
+    /// One search over the built-in presets and the official registry.
+    McpFind,
     SkillDetail,
     SkillDelete,
     /// Copy the selected skill into another agent's skills directory.
@@ -621,8 +631,7 @@ fn mcp_menu() -> Vec<Action> {
         Action::McpDelete,
         Action::McpCheck,
         Action::McpCheckAll,
-        Action::McpPreset(None),
-        Action::Registry,
+        Action::McpFind,
     ]
 }
 
@@ -661,9 +670,8 @@ impl Action {
             Action::McpCheck => "check mcp server".into(),
             Action::McpCheckAll => "check all mcp servers".into(),
             Action::McpToggle => "enable or disable mcp server".into(),
-            Action::McpPreset(Some(id)) => format!("mcp preset {id}"),
-            Action::McpPreset(None) => "apply an mcp preset".into(),
-            Action::Registry => "search the mcp registry".into(),
+            Action::McpPreset(id) => format!("mcp preset {id}"),
+            Action::McpFind => "find an mcp server".into(),
             Action::SkillDetail => "skill detail".into(),
             Action::SkillDelete => "delete skill".into(),
             Action::SkillCopy => "copy skill to another agent".into(),
@@ -706,7 +714,7 @@ impl Action {
             Action::McpCheckAll => "check all",
             Action::McpToggle => "on/off",
             Action::McpPreset(_) => "preset",
-            Action::Registry => "registry",
+            Action::McpFind => "find",
             Action::SkillDetail => "detail",
             Action::SkillDelete => "del",
             Action::SkillCopy => "copy",
@@ -755,10 +763,12 @@ impl Action {
             Action::McpCheck => "check whether this server could start".into(),
             Action::McpCheckAll => "check every mcp server of this agent in turn".into(),
             Action::McpToggle => "turn this mcp server on or off without deleting it".into(),
-            Action::McpPreset(Some(_)) => "add this ready-made mcp server to the agent".into(),
-            Action::McpPreset(None) => "choose a ready-made mcp server to add".into(),
-            Action::Registry => {
-                "search the official registry of MCP servers and install one".into()
+            Action::McpPreset(_) => "add this ready-made mcp server to the agent".into(),
+            // Named for the intent rather than for either source, because the
+            // whole point of the screen is that you need not know which of the
+            // two has what you are after.
+            Action::McpFind => {
+                "search the recommended servers and the official mcp registry".into()
             }
             Action::SkillDetail => "show the description, tools and any problem in full".into(),
             Action::SkillDelete => {
@@ -813,7 +823,10 @@ impl Action {
             Action::McpCheckAll => "C",
             Action::McpToggle => "u",
             Action::McpPreset(_) => "p",
-            Action::Registry => "g",
+            // Two keys, one screen. `p` is where the preset list used to be and
+            // `g` where the registry used to be, so neither habit is broken and
+            // both now arrive somewhere that shows the other source.
+            Action::McpFind => "p or g",
             Action::SkillDetail => "enter",
             Action::SkillDelete => "d",
             Action::SkillCopy => "y",
@@ -920,7 +933,7 @@ impl Action {
             Action::Lens(Some(Lens::Providers)) => None,
             Action::Lens(Some(Lens::Mcp)) => no_mcp(),
             Action::Lens(Some(Lens::Skills)) => no_skills(),
-            Action::McpAdd | Action::McpPreset(_) | Action::Registry => no_mcp(),
+            Action::McpAdd | Action::McpPreset(_) | Action::McpFind => no_mcp(),
             Action::McpDetail
             | Action::McpEdit
             | Action::McpDelete
@@ -983,11 +996,8 @@ impl Action {
             Action::McpCheck => app.schedule(Job::McpCheck, "checking…"),
             Action::McpCheckAll => app.schedule(Job::McpCheckAll, "checking every mcp server…"),
             Action::McpToggle => app.toggle_mcp(),
-            Action::McpPreset(Some(id)) => app.apply_mcp_preset_by_id(&id),
-            Action::McpPreset(None) => app.open_mcp_presets(),
-            Action::Registry => {
-                app.schedule(Job::Registry(String::new()), "searching the MCP registry...")
-            }
+            Action::McpPreset(id) => app.apply_mcp_preset_by_id(&id),
+            Action::McpFind => app.open_mcp_search(),
 
             Action::SkillDetail => app.open_skill_detail(),
             Action::SkillDelete => app.ask_delete_skill(),
@@ -1028,9 +1038,7 @@ impl Action {
         }));
         // Named rather than cycled, so searching "mcp" or "skills" finds the way in.
         actions.extend(LENSES.iter().map(|lens| Action::Lens(Some(*lens))));
-        actions.extend(
-            mcp_menu().into_iter().filter(|action| !matches!(action, Action::McpPreset(None))),
-        );
+        actions.extend(mcp_menu());
         actions.extend(skill_menu());
 
         actions.extend(
@@ -1043,7 +1051,7 @@ impl Action {
             preset::mcp_all()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|entry| Action::McpPreset(Some(entry.id))),
+                .map(|entry| Action::McpPreset(entry.id)),
         );
         actions.extend(app.agents.iter().map(|agent| Action::SelectAgent(agent.id.clone())));
         actions
@@ -1418,18 +1426,6 @@ impl PresetPicker {
     }
 }
 
-struct McpPresetPicker {
-    presets: Vec<preset::McpPreset>,
-    cursor: Cursor,
-    scope: Scope,
-}
-
-impl McpPresetPicker {
-    fn selected(&self) -> Option<&preset::McpPreset> {
-        self.presets.get(self.cursor.index())
-    }
-}
-
 /// One agent a skill could be copied into.
 #[derive(Debug, Clone)]
 struct SkillTarget {
@@ -1593,52 +1589,280 @@ fn update_report(status: &crate::update::Status) -> Report {
     report
 }
 
-/// Servers from the official MCP registry, filtered as you type.
+/// Where a candidate server came from, which is not a detail you can leave off
+/// the row.
 ///
-/// The query does two jobs and they are deliberately on different keys: typing
-/// filters what was already fetched, which is instant, and `ctrl+r` asks the
-/// registry again, which is an HTTP round trip. Filtering as a side effect of
-/// typing would put a request behind every keystroke.
-struct RegistryPicker {
-    /// What was last asked of the registry, and what is now filtering the answer.
+/// The two are not interchangeable. The presets are nine servers we have run and
+/// vouch for; the registry is twelve hundred we have not. Its search is fuzzy
+/// enough that "context7" surfaces a third-party fork above the real thing, so a
+/// row that did not say which side it came from would be asking the user to
+/// choose blind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Recommended,
+    Registry,
+}
+
+impl Source {
+    fn label(self) -> &'static str {
+        match self {
+            Source::Recommended => "recommended",
+            Source::Registry => "registry",
+        }
+    }
+
+    /// The star earns its place only on the side we vouch for.
+    fn mark(self) -> &'static str {
+        match self {
+            Source::Recommended => STAR,
+            Source::Registry => " ",
+        }
+    }
+}
+
+/// One server the picker could install, from either source.
+#[derive(Debug, Clone)]
+enum Candidate {
+    Recommended(preset::McpPreset),
+    Registry(registry::Entry),
+}
+
+impl Candidate {
+    fn source(&self) -> Source {
+        match self {
+            Candidate::Recommended(_) => Source::Recommended,
+            Candidate::Registry(_) => Source::Registry,
+        }
+    }
+
+    /// What the row is called, and what typing is matched against.
+    fn name(&self) -> &str {
+        match self {
+            Candidate::Recommended(preset) => &preset.id,
+            Candidate::Registry(entry) => &entry.name,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Candidate::Recommended(preset) => &preset.description,
+            Candidate::Registry(entry) => &entry.description,
+        }
+    }
+
+    /// The server this would write, or the reason there is not one.
+    fn server(&self) -> Result<mcp::Server> {
+        match self {
+            Candidate::Recommended(preset) => preset.server(None),
+            Candidate::Registry(entry) => entry.to_server(None),
+        }
+    }
+
+    /// How it would be started, in one line.
+    ///
+    /// A row with no command is a server the registry lists but this program
+    /// cannot launch — a container, usually — and saying so beats an em dash.
+    fn command(&self) -> String {
+        self.server()
+            .map(|server| server.transport.summary())
+            .unwrap_or_else(|_| "nothing installable".to_string())
+    }
+
+    /// Whether there is anything here this program could actually start.
+    fn installable(&self) -> bool {
+        self.server().is_ok()
+    }
+
+    /// What the status line calls the write, so a preset and a registry entry
+    /// are still reported as the different things they are.
+    fn what(&self) -> &'static str {
+        match self {
+            Candidate::Recommended(_) => "mcp preset",
+            Candidate::Registry(_) => "mcp install",
+        }
+    }
+
+    /// The identity two candidates have to share to be the same server.
+    ///
+    /// Not the display name: the registry carries forks and rebuilds under names
+    /// of their own, and two unrelated servers can be called the same thing.
+    /// What makes them one row is that they would run the same package, so this
+    /// is built from what would be launched. `None` when nothing would be.
+    fn install_key(&self) -> Option<String> {
+        self.server().ok().map(|server| match &server.transport {
+            mcp::Transport::Stdio { command, args } => format!("pkg:{}", package_of(command, args)),
+            mcp::Transport::Remote { url } => {
+                format!("url:{}", url.trim_end_matches('/').to_lowercase())
+            }
+        })
+    }
+}
+
+/// The package a launcher command line runs.
+///
+/// Both sources put it last: a preset spells out the command line the server's
+/// own README leads with, and the registry appends its package identifier after
+/// the launcher's arguments. A command line that ends in a flag is not naming a
+/// package at all, and a plain binary is its own identity.
+fn package_of(command: &str, args: &[String]) -> String {
+    match args.last() {
+        Some(arg) if !arg.starts_with('-') => strip_version(arg),
+        _ => command.to_lowercase(),
+    }
+}
+
+/// `@upstash/context7-mcp@1.0.14` and `@upstash/context7-mcp` are one package.
+///
+/// The leading `@` of a scoped npm name is skipped, so only a version suffix is
+/// cut off and never the scope itself.
+fn strip_version(package: &str) -> String {
+    match package.char_indices().skip(1).find(|(_, ch)| *ch == '@') {
+        Some((at, _)) => package[..at].to_lowercase(),
+        None => package.to_lowercase(),
+    }
+}
+
+/// One search over both places an MCP server can come from.
+///
+/// "Find me an MCP server" is one intent, so it is one screen. It used to be
+/// two, on two keys, and from inside either there was no sign the other existed.
+///
+/// The query does two jobs and they stay on separate keys: typing filters what
+/// is already in hand, which is instant, and `ctrl+r` asks the registry, which
+/// is an HTTP round trip. Filtering as a side effect of typing would put a
+/// request behind every keystroke, so what the registry contributed is always
+/// the answer to the last question that was actually asked.
+struct McpSearch {
+    /// The curated nine, always in hand, so the panel opens with something worth
+    /// reading rather than the alphabetical head of a registry.
+    presets: Vec<preset::McpPreset>,
+    /// What the registry last returned, replaced whole by each new query.
+    found: Vec<registry::Entry>,
+    /// The query the registry answered, or `None` while it has not been asked.
+    /// The hint bar says which, so results are never mistaken for live ones.
+    asked: Option<String>,
+    /// What is being typed, which filters `entries` and is what `ctrl+r` sends.
     query: String,
-    entries: Vec<registry::Entry>,
+    /// Both sources merged and de-duplicated, recommended first.
+    entries: Vec<Candidate>,
+    /// How many of `entries` are recommended, so ranking can hold them ahead of
+    /// the registry instead of letting a fuzzy score interleave the two.
+    recommended: usize,
     matches: Vec<usize>,
     cursor: Cursor,
     scope: Scope,
 }
 
-impl RegistryPicker {
-    fn new(query: String, entries: Vec<registry::Entry>) -> Self {
+impl McpSearch {
+    fn new(presets: Vec<preset::McpPreset>) -> Self {
         let mut picker = Self {
-            query,
-            entries,
+            presets,
+            found: Vec::new(),
+            asked: None,
+            query: String::new(),
+            entries: Vec::new(),
+            recommended: 0,
             matches: Vec::new(),
             cursor: Cursor::default(),
             scope: Scope::default(),
         };
-        picker.rebuild();
+        picker.merge();
         picker
     }
 
-    fn rebuild(&mut self) {
-        self.matches = rank_by(&self.entries, &self.query, |entry| entry.name.clone());
+    /// Take a registry answer, keeping everything else where it was.
+    fn answered(&mut self, query: &str, found: Vec<registry::Entry>) {
+        self.found = found;
+        self.asked = Some(query.to_string());
+        self.merge();
+    }
+
+    /// Rebuild the merged list from the two sources.
+    ///
+    /// A registry entry that would run a package a preset already runs is
+    /// dropped rather than listed twice, and the preset is the one kept: it is
+    /// the curated description of the same server.
+    fn merge(&mut self) {
+        let mut entries: Vec<Candidate> =
+            self.presets.iter().cloned().map(Candidate::Recommended).collect();
+        self.recommended = entries.len();
+
+        let mut seen: Vec<String> = entries.iter().filter_map(Candidate::install_key).collect();
+        for entry in &self.found {
+            let candidate = Candidate::Registry(entry.clone());
+            match candidate.install_key() {
+                // Nothing runnable has no package to collide with, so it can
+                // only ever be itself.
+                Some(key) if seen.contains(&key) => continue,
+                Some(key) => seen.push(key),
+                None => {}
+            }
+            entries.push(candidate);
+        }
+
+        self.entries = entries;
+        self.refilter();
+    }
+
+    /// Re-rank against the query, which touches nothing but the order.
+    ///
+    /// The two sources are ranked separately and concatenated, so a registry
+    /// name that happens to score better can never climb above the servers we
+    /// vouch for.
+    fn refilter(&mut self) {
+        let name = |candidate: &Candidate| candidate.name().to_string();
+        let typed_since = self.typed_since_asking().to_string();
+        let query = self.query.clone();
+        let (top, rest) = self.entries.split_at(self.recommended);
+
+        let mut matches = rank_by(top, &query, name);
+        matches
+            .extend(rank_by(rest, &typed_since, name).into_iter().map(|at| at + self.recommended));
+
+        self.matches = matches;
         self.cursor.clamp(self.matches.len());
     }
 
-    fn selected(&self) -> Option<&registry::Entry> {
+    /// What has been typed since the registry was asked, which is all the
+    /// registry's own rows are filtered by.
+    ///
+    /// The registry answered a question in its own fuzzy way: a search for
+    /// "continuum" comes back with names that do not contain the word. Those
+    /// rows are its answer, so re-applying the query that fetched them would
+    /// throw away most of what was just asked for. Anything typed afterwards is
+    /// a genuine narrowing and does filter them.
+    fn typed_since_asking(&self) -> &str {
+        match &self.asked {
+            Some(asked) if self.query.starts_with(asked.as_str()) => &self.query[asked.len()..],
+            _ => &self.query,
+        }
+    }
+
+    fn selected(&self) -> Option<&Candidate> {
         self.matches.get(self.cursor.index()).and_then(|index| self.entries.get(*index))
     }
-}
 
-/// How a registry entry would be started, in one line.
-fn launch_summary(entry: &registry::Entry) -> String {
-    match entry.preferred() {
-        Some(registry::Launch::Package { runtime, args, .. }) => {
-            format!("{runtime} {}", args.join(" "))
-        }
-        Some(registry::Launch::Remote { url }) => url.clone(),
-        None => "nothing installable".to_string(),
+    /// How many of the rows now showing come from each side.
+    fn shown(&self) -> (usize, usize) {
+        let recommended = self.matches.iter().filter(|index| **index < self.recommended).count();
+        (recommended, self.matches.len() - recommended)
+    }
+
+    /// What the list is made of, for the panel title.
+    ///
+    /// Both sources are accounted for in every state, so there is no way to be
+    /// looking at this screen without knowing the other one is there — which is
+    /// the whole failure it was built to fix. When the registry has answered,
+    /// the question it answered is named, because its rows are as old as the
+    /// last `ctrl+r` and not as old as the last keystroke.
+    fn summary(&self) -> String {
+        let (recommended, from_registry) = self.shown();
+        let registry = match self.asked.as_deref() {
+            None => "registry not asked yet · ctrl+r".to_string(),
+            Some("") => format!("{from_registry} from the registry"),
+            Some(asked) => format!("{from_registry} from the registry for {asked:?}"),
+        };
+        format!("{recommended} recommended · {registry}")
     }
 }
 
@@ -2053,14 +2277,14 @@ enum Overlay {
     McpDetail {
         scroll: u16,
     },
-    McpPresets(McpPresetPicker),
     SkillDetail {
         scroll: u16,
     },
     SkillCopy(SkillCopyPicker),
     /// What `doctor` or `update` had to say.
     Report(Report),
-    Registry(RegistryPicker),
+    /// One search over the presets and the official registry at once.
+    McpSearch(McpSearch),
 }
 
 /// Work that must be visibly announced before it blocks the event loop.
@@ -2436,12 +2660,12 @@ impl App {
             }
             KeyCode::Char('c') => self.dispatch_lens(Action::Check, Action::McpCheck, None),
             KeyCode::Char('C') => self.dispatch_lens(Action::CheckAll, Action::McpCheckAll, None),
-            KeyCode::Char('p') => {
-                self.dispatch_lens(Action::Preset(None), Action::McpPreset(None), None)
-            }
-            // The registry lists a thousand-odd servers and the presets nine, so
-            // they are different enough things to deserve separate keys.
-            KeyCode::Char('g') if self.lens() == Lens::Mcp => self.dispatch(Action::Registry),
+            KeyCode::Char('p') => self.dispatch_lens(Action::Preset(None), Action::McpFind, None),
+            // Not gated on the lens, unlike the keys above it. Wanting an MCP
+            // server is not something you should have to have already found the
+            // MCP lens to act on, and the picker switches the pane to it on the
+            // way out anyway.
+            KeyCode::Char('g') => self.dispatch(Action::McpFind),
             // Only the skills lens has anywhere to copy something to.
             KeyCode::Char('y') if self.lens() == Lens::Skills => self.dispatch(Action::SkillCopy),
 
@@ -2563,17 +2787,12 @@ impl App {
                     picker.cursor = Cursor { index };
                 }
             }
-            Some(Overlay::McpPresets(picker)) => {
-                if let Some(index) = rows.row(at, picker.presets.len()) {
-                    picker.cursor = Cursor { index };
-                }
-            }
             Some(Overlay::SkillCopy(picker)) => {
                 if let Some(index) = rows.row(at, picker.targets.len()) {
                     picker.cursor = Cursor { index };
                 }
             }
-            Some(Overlay::Registry(picker)) => {
+            Some(Overlay::McpSearch(picker)) => {
                 if let Some(index) = rows.row(at, picker.matches.len()) {
                     picker.cursor = Cursor { index };
                 }
@@ -2598,11 +2817,10 @@ impl App {
                 Overlay::Palette(palette) => palette.cursor.step(delta, palette.matches.len()),
                 Overlay::Models(picker) => picker.cursor.step(delta, picker.matches.len()),
                 Overlay::McpDetail { scroll } => *scroll = scrolled(*scroll),
-                Overlay::McpPresets(picker) => picker.cursor.step(delta, picker.presets.len()),
                 Overlay::SkillDetail { scroll } => *scroll = scrolled(*scroll),
                 Overlay::SkillCopy(picker) => picker.cursor.step(delta, picker.targets.len()),
                 Overlay::Report(report) => report.scroll = scrolled(report.scroll),
-                Overlay::Registry(picker) => picker.cursor.step(delta, picker.matches.len()),
+                Overlay::McpSearch(picker) => picker.cursor.step(delta, picker.matches.len()),
                 Overlay::Form(_) | Overlay::Confirm(_) => {}
             }
             return;
@@ -2720,26 +2938,55 @@ impl App {
         }
     }
 
-    /// Ask the registry, and offer whatever came back as a picker.
+    /// Ask the registry, and fold the answer into the picker that asked.
+    ///
+    /// The panel stays where it is rather than being replaced, so the query, the
+    /// scope and the presets beside it all survive a search.
     fn search_registry(&mut self, query: &str) {
-        match registry::search(query, REGISTRY_LIMIT) {
-            Ok(entries) if entries.is_empty() => {
-                self.say(Tone::Info, "the registry returned nothing for that")
-            }
-            Ok(entries) => {
-                let count = entries.len();
-                self.overlay =
-                    Some(Overlay::Registry(RegistryPicker::new(query.to_string(), entries)));
-                self.say(Tone::Info, format!("{count} server(s) in the registry"));
-            }
-            Err(err) => self.say(Tone::Bad, format!("registry search failed: {err:#}")),
+        let found = match registry::search(query, REGISTRY_LIMIT) {
+            Ok(found) => found,
+            Err(err) => return self.say(Tone::Bad, format!("registry search failed: {err:#}")),
+        };
+
+        let Some(Overlay::McpSearch(picker)) = self.overlay.as_mut() else { return };
+        picker.answered(query, found);
+
+        // The count worth reporting is what the merge left, not what arrived:
+        // versions and packages the presets already cover are gone by now.
+        let (_, from_registry) = picker.shown();
+        match from_registry {
+            0 => self.say(Tone::Info, "the registry had nothing new for that"),
+            count => self.say(Tone::Info, format!("{count} server(s) from the registry")),
         }
     }
 
-    /// Add a registry entry to the selected agent.
-    fn install_registry(&mut self, entry: &registry::Entry) {
-        if let Some((server, missing)) = self.registry_server(entry) {
-            self.install_server("mcp install", server, missing);
+    /// Install whichever side the chosen row came from.
+    ///
+    /// Only the choosing is shared. Each source keeps the path in it already
+    /// had: a preset builds the server it describes, a registry entry goes
+    /// through [`registry::Entry::to_server`], and both report what they still
+    /// want from the environment.
+    fn install_candidate(&mut self, candidate: &Candidate, scope: Scope) {
+        let Some((server, missing)) = self.candidate_server(candidate) else { return };
+        match scope {
+            Scope::Selected => self.install_server(candidate.what(), server, missing),
+            Scope::EveryAgent => self.ask_broadcast(
+                Reach::McpServers,
+                &format!("Launch {}", candidate.name()),
+                "Each config is changed separately, and undo is per agent.",
+                Pending::InstallServer {
+                    server: Box::new(server),
+                    missing,
+                    what: candidate.what(),
+                },
+            ),
+        }
+    }
+
+    fn candidate_server(&mut self, candidate: &Candidate) -> Option<(mcp::Server, Vec<String>)> {
+        match candidate {
+            Candidate::Recommended(preset) => self.mcp_preset_server(preset),
+            Candidate::Registry(entry) => self.registry_server(entry),
         }
     }
 
@@ -2904,16 +3151,15 @@ impl App {
         });
     }
 
-    fn open_mcp_presets(&mut self) {
+    /// Open the one screen for finding an MCP server.
+    ///
+    /// Opens on the presets alone and reaches nothing: the registry is a round
+    /// trip, and firing one on the way in would both stall the panel and greet
+    /// the user with the alphabetical head of twelve hundred servers. `ctrl+r`
+    /// asks it, which the hint bar says from the first frame.
+    fn open_mcp_search(&mut self) {
         match preset::mcp_all() {
-            Ok(presets) if presets.is_empty() => self.say(Tone::Info, "no MCP presets available"),
-            Ok(presets) => {
-                self.overlay = Some(Overlay::McpPresets(McpPresetPicker {
-                    presets,
-                    cursor: Cursor::default(),
-                    scope: Scope::default(),
-                }))
-            }
+            Ok(presets) => self.overlay = Some(Overlay::McpSearch(McpSearch::new(presets))),
             Err(err) => self.say(Tone::Bad, format!("MCP presets unreadable: {err:#}")),
         }
     }
@@ -3413,12 +3659,11 @@ impl App {
             Overlay::McpDetail { scroll } => {
                 scroll_key(key, scroll).map(|scroll| Overlay::McpDetail { scroll })
             }
-            Overlay::McpPresets(picker) => self.mcp_preset_key(key, picker),
             Overlay::SkillDetail { scroll } => {
                 scroll_key(key, scroll).map(|scroll| Overlay::SkillDetail { scroll })
             }
             Overlay::SkillCopy(picker) => self.skill_copy_key(key, picker),
-            Overlay::Registry(picker) => self.registry_key(key, raw, picker),
+            Overlay::McpSearch(picker) => self.mcp_search_key(key, raw, picker),
             Overlay::Report(report) => scroll_key(key, report.scroll)
                 .map(|scroll| Overlay::Report(Report { scroll, ..report })),
         };
@@ -3499,63 +3744,48 @@ impl App {
         Some(Overlay::Models(picker))
     }
 
-    fn registry_key(
+    fn mcp_search_key(
         &mut self,
         key: KeyEvent,
         raw: KeyEvent,
-        mut picker: RegistryPicker,
+        mut picker: McpSearch,
     ) -> Option<Overlay> {
-        // Asking the registry again is a round trip, so it is its own key rather
-        // than something typing sets off.
+        // Asking the registry is a round trip, so it is its own key rather than
+        // something typing sets off.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
             let query = picker.query.clone();
-            self.schedule(Job::Registry(query), "searching the MCP registry...");
-            return Some(Overlay::Registry(picker));
+            self.schedule(Job::Registry(query), "searching the MCP registry…");
+            return Some(Overlay::McpSearch(picker));
         }
 
         if is_scope_toggle(key) {
             picker.scope = picker.scope.toggled();
-            return Some(Overlay::Registry(picker));
+            return Some(Overlay::McpSearch(picker));
         }
 
         match key.code {
             KeyCode::Esc => return None,
             KeyCode::Enter => {
-                let entry = picker.selected().cloned()?;
-                match picker.scope {
-                    Scope::Selected => self.install_registry(&entry),
-                    Scope::EveryAgent => {
-                        if let Some((server, missing)) = self.registry_server(&entry) {
-                            self.ask_broadcast(
-                                Reach::McpServers,
-                                &format!("Launch {}", entry.name),
-                                "Each config is changed separately, and undo is per agent.",
-                                Pending::InstallServer {
-                                    server: Box::new(server),
-                                    missing,
-                                    what: "mcp install",
-                                },
-                            );
-                        }
-                    }
-                }
+                let candidate = picker.selected().cloned()?;
+                self.install_candidate(&candidate, picker.scope);
                 return None;
             }
             KeyCode::Up => picker.cursor.step(-1, picker.matches.len()),
             KeyCode::Down => picker.cursor.step(1, picker.matches.len()),
             KeyCode::Backspace => {
                 picker.query.pop();
-                picker.rebuild();
+                picker.refilter();
             }
             KeyCode::Char(_) => {
                 if let KeyCode::Char(typed) = raw.code {
                     picker.query.push(typed);
-                    picker.rebuild();
+                    // Filtering only, never fetching: the list is already in hand.
+                    picker.refilter();
                 }
             }
             _ => {}
         }
-        Some(Overlay::Registry(picker))
+        Some(Overlay::McpSearch(picker))
     }
 
     fn form_key(&mut self, key: KeyEvent, raw: KeyEvent, mut form: Form) -> Option<Overlay> {
@@ -3790,47 +4020,6 @@ impl App {
         }
     }
 
-    fn mcp_preset_key(&mut self, key: KeyEvent, mut picker: McpPresetPicker) -> Option<Overlay> {
-        if is_scope_toggle(key) {
-            picker.scope = picker.scope.toggled();
-            return Some(Overlay::McpPresets(picker));
-        }
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.cursor.step(-1, picker.presets.len());
-                Some(Overlay::McpPresets(picker))
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.cursor.step(1, picker.presets.len());
-                Some(Overlay::McpPresets(picker))
-            }
-            KeyCode::Enter => {
-                let entry = picker.selected().cloned()?;
-                match picker.scope {
-                    Scope::Selected => self.apply_mcp_preset(&entry),
-                    Scope::EveryAgent => {
-                        if let Some((server, missing)) = self.mcp_preset_server(&entry) {
-                            self.ask_broadcast(
-                                Reach::McpServers,
-                                &format!("Launch {}", entry.id),
-                                "Each config is changed separately, and undo is per agent.",
-                                Pending::InstallServer {
-                                    server: Box::new(server),
-                                    missing,
-                                    what: "mcp preset",
-                                },
-                            );
-                        }
-                    }
-                }
-                None
-            }
-            _ => Some(Overlay::McpPresets(picker)),
-        }
-    }
-
     fn skill_copy_key(&mut self, key: KeyEvent, mut picker: SkillCopyPicker) -> Option<Overlay> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => None,
@@ -3981,11 +4170,6 @@ impl App {
             Some(Overlay::McpDetail { scroll }) => {
                 hits.overlay = Some(self.render_mcp_detail(frame, *scroll))
             }
-            Some(Overlay::McpPresets(picker)) => {
-                let (area, rows) = render_mcp_presets(frame, picker);
-                hits.overlay = Some(area);
-                hits.overlay_rows = rows;
-            }
             Some(Overlay::SkillDetail { scroll }) => {
                 hits.overlay = Some(self.render_skill_detail(frame, *scroll))
             }
@@ -3995,8 +4179,8 @@ impl App {
                 hits.overlay_rows = rows;
             }
             Some(Overlay::Report(report)) => hits.overlay = Some(render_report(frame, report)),
-            Some(Overlay::Registry(picker)) => {
-                let (area, rows) = render_registry(frame, picker);
+            Some(Overlay::McpSearch(picker)) => {
+                let (area, rows) = render_mcp_search(frame, picker);
                 hits.overlay = Some(area);
                 hits.overlay_rows = rows;
             }
@@ -4132,8 +4316,7 @@ impl App {
                 Hint::plain("enter", "copy here"),
                 Hint::plain("esc", "cancel"),
             ],
-            Some(Overlay::Presets(PresetPicker { scope, .. }))
-            | Some(Overlay::McpPresets(McpPresetPicker { scope, .. })) => {
+            Some(Overlay::Presets(PresetPicker { scope, .. })) => {
                 let mut hints = vec![Hint::plain("↑↓", "move")];
                 hints.extend(scope.hints("apply"));
                 hints.push(Hint::plain("esc", "cancel"));
@@ -4145,9 +4328,14 @@ impl App {
                 Hint::plain("enter", "run"),
                 Hint::plain("esc", "close"),
             ],
-            Some(Overlay::Registry(picker)) => {
-                let mut hints =
-                    vec![Hint::plain("type", "filter"), Hint::plain("ctrl+r", "search registry")];
+            Some(Overlay::McpSearch(picker)) => {
+                // `type` and `ctrl+r` sit next to each other on purpose: the
+                // pair is the whole contract of the screen, that filtering is
+                // free and asking the registry is a round trip you ask for.
+                let mut hints = vec![
+                    Hint::plain("type", "filter what is listed"),
+                    Hint::plain("ctrl+r", "ask the registry for it"),
+                ];
                 hints.extend(picker.scope.hints("install"));
                 hints.push(Hint::plain("esc", "cancel"));
                 hints
@@ -4202,8 +4390,7 @@ impl App {
                         Action::McpEdit,
                         Action::McpDelete,
                         Action::McpCheck,
-                        Action::McpPreset(None),
-                        Action::Registry,
+                        Action::McpFind,
                         Action::Palette,
                         Action::Help,
                     ]),
@@ -4763,6 +4950,7 @@ impl App {
             empty: "no action matches that",
             count: palette.matches.len(),
             selected: palette.cursor.index(),
+            width: SEARCH_WIDTH,
         };
 
         render_search_overlay(frame, search, |width| {
@@ -4790,29 +4978,41 @@ impl App {
     }
 }
 
-fn render_registry(frame: &mut Frame, picker: &RegistryPicker) -> (Rect, RowsAt) {
+/// The one picker for finding an MCP server, over both sources at once.
+///
+/// A star and a named column carry which side a row came from, because a
+/// curated preset and a stranger's fork of it are not the same offer and the
+/// difference has to survive being read at a glance.
+fn render_mcp_search(frame: &mut Frame, picker: &McpSearch) -> (Rect, RowsAt) {
     let search = Search {
-        title: &format!("mcp registry{}", picker.scope.suffix()),
+        title: &format!("mcp servers · {}{}", picker.summary(), picker.scope.suffix()),
         query: &picker.query,
-        placeholder: "type to filter these, ctrl+r to ask the registry again",
-        empty: "nothing fetched matches that; ctrl+r asks the registry",
+        placeholder: "type to filter · ctrl+r searches the official registry for it",
+        empty: "nothing here matches that; ctrl+r asks the registry",
         count: picker.matches.len(),
         selected: picker.cursor.index(),
+        // The rightmost column is a sentence, and it is what you choose by.
+        width: WIDE_SEARCH_WIDTH,
     };
 
     render_search_overlay(frame, search, |width| {
-        let columns = Columns::flexible(width, &[30, 24], 2, 18);
+        // The description takes the slack: a reverse-DNS name is long but skimmable
+        // truncated, whereas a description cut to nothing tells you nothing.
+        let columns = Columns::flexible(width, &[1, 26, 11, 26], 4, 20);
         picker
             .matches
             .iter()
             .filter_map(|index| picker.entries.get(*index))
-            .map(|entry| {
+            .map(|candidate| {
+                let source = candidate.source();
                 let mut row = Row::default();
-                row.cell(&columns, &entry.name, Style::default().fg(palette::TEXT));
-                row.cell(&columns, &launch_summary(entry), Style::default().fg(palette::MUTED));
-                row.cell(&columns, &entry.description, Style::default().fg(palette::FAINT));
+                row.cell(&columns, source.mark(), Style::default().fg(palette::ACCENT));
+                row.cell(&columns, candidate.name(), Style::default().fg(palette::TEXT));
+                row.cell(&columns, source.label(), Style::default().fg(palette::ACCENT_MUTED));
+                row.cell(&columns, &candidate.command(), Style::default().fg(palette::MUTED));
+                row.cell(&columns, candidate.description(), Style::default().fg(palette::FAINT));
                 // Nothing this program can start is nothing worth choosing.
-                row.dim = entry.preferred().is_none();
+                row.dim = !candidate.installable();
                 row
             })
             .collect()
@@ -4827,6 +5027,7 @@ fn render_models(frame: &mut Frame, picker: &ModelPicker) -> (Rect, RowsAt) {
         empty: "no model matches that",
         count: picker.matches.len(),
         selected: picker.cursor.index(),
+        width: SEARCH_WIDTH,
     };
 
     render_search_overlay(frame, search, |width| {
@@ -4877,6 +5078,11 @@ struct Search<'a> {
     empty: &'a str,
     count: usize,
     selected: usize,
+    /// How wide the panel would like to be, clamped to the terminal. A list of
+    /// ids and prices reads fine in a narrow column; one whose rightmost cell is
+    /// a sentence needs every column the terminal can spare, or the sentence —
+    /// the part you actually choose by — is the first thing cut.
+    width: u16,
 }
 
 /// A query line above a list: the shape both the command palette and the model
@@ -4893,7 +5099,7 @@ fn render_search_overlay(
 
     let screen = frame.area();
     let height = (search.count as u16 + 4).clamp(5, screen.height.saturating_sub(4).max(5));
-    let area = centered_fixed(screen, 76, height);
+    let area = centered_fixed(screen, search.width, height);
     let inner = overlay_frame(frame, area, search.title);
 
     let [input, list] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
@@ -5204,39 +5410,6 @@ fn render_presets(frame: &mut Frame, picker: &PresetPicker) -> (Rect, RowsAt) {
     lines.extend(card.iter().map(|(label, value)| labelled(label, value)));
     frame.render_widget(Paragraph::new(lines), detail);
 
-    (area, rows_at)
-}
-
-fn render_mcp_presets(frame: &mut Frame, picker: &McpPresetPicker) -> (Rect, RowsAt) {
-    let area = centered(frame.area(), 78, 74);
-    let inner = area.width.saturating_sub(2) as usize;
-    let columns = Columns::flexible(inner.saturating_sub(1), &[16, 26], 2, 20);
-
-    let rows = picker
-        .presets
-        .iter()
-        .map(|entry| {
-            let command = entry
-                .server(None)
-                .map(|server| server.transport.summary())
-                .unwrap_or_else(|_| ABSENT.to_string());
-            let mut row = Row::default();
-            row.cell(&columns, &entry.id, Style::default().fg(palette::TEXT));
-            row.cell(&columns, &command, Style::default().fg(palette::MUTED));
-            row.cell(&columns, &entry.description, Style::default().fg(palette::FAINT));
-            row
-        })
-        .collect();
-
-    let rows_at = ListPane {
-        title: format!("mcp presets {}{}", picker.presets.len(), picker.scope.suffix()).into(),
-        focused: true,
-        header: Some(columns.header(&["preset", "command or url", "what it does"])),
-        rows,
-        selected: picker.cursor.index(),
-        empty: vec!["no MCP presets available".to_string()],
-    }
-    .render_overlay(frame, area);
     (area, rows_at)
 }
 
@@ -5852,11 +6025,7 @@ mod render_tests {
                 every: Vec::new(),
             }),
             Overlay::McpDetail { scroll: 0 },
-            Overlay::McpPresets(McpPresetPicker {
-                presets: preset::mcp_all().expect("shipped mcp presets"),
-                cursor: Cursor::default(),
-                scope: Scope::default(),
-            }),
+            Overlay::McpSearch(McpSearch::new(preset::mcp_all().expect("shipped mcp presets"))),
             Overlay::Form(Form::mcp("codex", None)),
             Overlay::SkillDetail { scroll: 0 },
             Overlay::SkillCopy(SkillCopyPicker {
@@ -6334,13 +6503,170 @@ mod render_tests {
         ]
     }
 
+    /// A registry entry running `package`, under whatever name.
+    fn registry_running(name: &str, package: &str) -> registry::Entry {
+        registry::Entry {
+            name: name.into(),
+            title: None,
+            description: "from the registry".into(),
+            version: None,
+            options: vec![registry::Launch::Package {
+                runtime: "npx".into(),
+                args: vec!["-y".into(), package.into()],
+                env: Vec::new(),
+            }],
+        }
+    }
+
+    /// The picker as `p` and `g` open it, on the real built-in presets.
+    fn mcp_search() -> McpSearch {
+        McpSearch::new(preset::mcp_all().expect("the built-in MCP presets must parse"))
+    }
+
+    fn rows(picker: &McpSearch) -> Vec<String> {
+        picker.matches.iter().map(|index| picker.entries[*index].name().to_string()).collect()
+    }
+
     #[test]
-    fn a_registry_row_says_how_the_server_would_be_started() {
+    fn a_row_says_how_the_server_would_be_started() {
         let entries = registry_entries();
-        assert_eq!(launch_summary(&entries[0]), "npx -y server-filesystem@0.1.2");
-        assert_eq!(launch_summary(&entries[1]), "https://mcp.example.invalid/mcp");
+        let command = |entry: &registry::Entry| Candidate::Registry(entry.clone()).command();
+
+        assert_eq!(command(&entries[0]), "npx -y server-filesystem@0.1.2");
+        assert_eq!(command(&entries[1]), "https://mcp.example.invalid/mcp");
         // Nothing this program can start, and the row says so rather than lying.
-        assert_eq!(launch_summary(&entries[2]), "nothing installable");
+        assert_eq!(command(&entries[2]), "nothing installable");
+        assert!(!Candidate::Registry(entries[2].clone()).installable());
+    }
+
+    #[test]
+    fn the_picker_opens_on_the_recommended_servers_and_reaches_nothing() {
+        let picker = mcp_search();
+
+        assert_eq!(picker.recommended, 9, "the nine built-ins are the recommended set");
+        assert_eq!(picker.matches.len(), 9, "an empty query lists the recommended set");
+        assert!(picker.asked.is_none(), "the registry was asked on the way in");
+        assert!(rows(&picker).contains(&"continuum".to_string()), "{:?}", rows(&picker));
+        assert!(picker.summary().contains("registry not asked yet"), "{}", picker.summary());
+    }
+
+    #[test]
+    fn the_same_package_under_two_names_collapses_onto_the_preset() {
+        let mut picker = mcp_search();
+        // What the registry really returns for "context7": a third-party fork,
+        // named nothing like the preset, running the very same package.
+        picker.answered(
+            "context7",
+            vec![registry_running(
+                "ai.smithery/renCosta2025-context7fork",
+                "@upstash/context7-mcp",
+            )],
+        );
+
+        let listed = rows(&picker);
+        assert!(listed.contains(&"context7".to_string()), "the preset went missing: {listed:?}");
+        assert!(
+            !listed.iter().any(|name| name.contains("context7fork")),
+            "the same package was listed twice: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_suffix_does_not_make_it_a_different_server() {
+        let mut picker = mcp_search();
+        // The registry pins a version; the preset does not. One server.
+        picker.answered(
+            "",
+            vec![registry_running("io.github.upstash/c7", "@upstash/context7-mcp@1.0.14")],
+        );
+
+        assert!(
+            !rows(&picker).contains(&"io.github.upstash/c7".to_string()),
+            "a pinned version was mistaken for a different package: {:?}",
+            rows(&picker)
+        );
+    }
+
+    #[test]
+    fn two_servers_that_merely_share_a_name_both_survive() {
+        let mut picker = mcp_search();
+        // Same display name as the preset, entirely different package. Collapsing
+        // these would hide one of two real choices.
+        picker.answered("memory", vec![registry_running("memory", "someone-elses-memory-server")]);
+
+        let listed = rows(&picker);
+        assert_eq!(
+            listed.iter().filter(|name| *name == "memory").count(),
+            2,
+            "a name collision was treated as a duplicate: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn the_recommended_servers_stay_above_the_registry() {
+        let mut picker = mcp_search();
+        // An exact name match, which would outrank every preset on score alone.
+        picker.answered("git", vec![registry_running("git", "some-other-git-server")]);
+
+        let listed = rows(&picker);
+        let registry_at = listed.iter().rposition(|name| name == "git").expect("no registry row");
+        let recommended = picker.shown().0;
+        assert!(
+            registry_at >= recommended,
+            "a registry row climbed above the recommended ones: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn typing_filters_what_is_in_hand_without_asking_the_registry_again() {
+        let mut picker = mcp_search();
+        picker.answered("fetch", vec![registry_running("io.example/grabber", "grabber-mcp")]);
+        let asked = picker.asked.clone();
+        let found = picker.found.len();
+
+        // The registry answered "fetch" in its own fuzzy way, so its rows are not
+        // re-filtered by the word that fetched them.
+        assert!(rows(&picker).contains(&"io.example/grabber".to_string()));
+
+        picker.query.push_str("fetch");
+        picker.refilter();
+        assert_eq!(picker.asked, asked, "typing re-queried the registry");
+        assert_eq!(picker.found.len(), found, "typing replaced what was fetched");
+        assert!(rows(&picker).contains(&"fetch".to_string()), "the preset was filtered out");
+
+        // Typed after the search, so this genuinely narrows both sides.
+        picker.query.push_str("-no-such-thing");
+        picker.refilter();
+        assert!(picker.matches.is_empty(), "{:?}", rows(&picker));
+        assert!(picker.selected().is_none(), "a cursor left pointing at a gone row");
+    }
+
+    #[test]
+    fn the_title_names_the_query_the_registry_rows_answered() {
+        let mut picker = mcp_search();
+        picker.answered("github", vec![registry_running("io.example/gh", "gh-mcp")]);
+
+        let summary = picker.summary();
+        assert!(summary.contains("recommended"), "{summary}");
+        assert!(
+            summary.contains("\"github\""),
+            "the rows do not say what they answered: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_package_is_identified_by_what_it_runs_rather_than_what_it_is_called() {
+        // A scoped name keeps its scope and loses only the version.
+        assert_eq!(strip_version("@upstash/context7-mcp@1.0.14"), "@upstash/context7-mcp");
+        assert_eq!(strip_version("@playwright/mcp@latest"), "@playwright/mcp");
+        assert_eq!(strip_version("mcp-server-git"), "mcp-server-git");
+
+        let arg = |value: &str| vec![value.to_string()];
+        assert_eq!(package_of("npx", &arg("thing")), "thing");
+        // A command line ending in a flag names no package, so the binary is the
+        // identity — otherwise every `-y` would collapse onto every other.
+        assert_eq!(package_of("my-server", &arg("-y")), "my-server");
+        assert_eq!(package_of("my-server", &[]), "my-server");
     }
 
     #[test]
@@ -6354,40 +6680,67 @@ mod render_tests {
     }
 
     #[test]
-    fn typing_in_the_registry_picker_filters_what_was_already_fetched() {
-        let mut picker = RegistryPicker::new(String::new(), registry_entries());
-        assert_eq!(picker.matches.len(), 3);
-
-        picker.query.push_str("hosted");
-        picker.rebuild();
-        assert_eq!(picker.matches.len(), 1);
-        assert_eq!(picker.selected().map(|entry| entry.name.as_str()), Some("ac.example/hosted"));
-
-        picker.query.push_str("-no-such-thing");
-        picker.rebuild();
-        assert!(picker.matches.is_empty());
-        assert!(picker.selected().is_none(), "a cursor left pointing at a gone row");
-    }
-
-    #[test]
-    fn the_registry_search_is_announced_before_it_reaches_the_network() {
+    fn opening_the_picker_costs_no_request_and_searching_is_announced() {
         let mut app = scene();
         app.lens = Lens::Mcp;
-        app.dispatch(Action::Registry);
+        app.dispatch(Action::McpFind);
 
+        assert!(matches!(app.overlay, Some(Overlay::McpSearch(_))), "the picker did not open");
+        assert!(app.pending.is_none(), "opening the picker reached the network");
+
+        // ctrl+r is the round trip, and it is announced before it blocks.
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_r);
         let Some(Job::Registry(query)) = &app.pending else {
             panic!("the registry search was not scheduled as a job: {:?}", app.pending)
         };
-        assert!(query.is_empty(), "the first search lists whatever the registry returns first");
+        assert!(query.is_empty(), "an empty query lists whatever the registry returns first");
         assert!(app.status.text.contains("registry"), "unannounced: {:?}", app.status.text);
+        assert!(matches!(app.overlay, Some(Overlay::McpSearch(_))), "the picker was closed");
     }
 
     #[test]
-    fn an_agent_that_stores_no_mcp_servers_is_not_offered_the_registry() {
+    fn both_keys_land_on_the_one_picker_from_any_lens() {
+        // `p` where the preset list used to be, `g` where the registry used to
+        // be, and neither can now show one source without the other.
+        for (lens, key) in
+            [(Lens::Mcp, 'p'), (Lens::Mcp, 'g'), (Lens::Providers, 'g'), (Lens::Skills, 'g')]
+        {
+            let mut app = scene();
+            app.lens = lens;
+            app.on_key(KeyEvent::from(KeyCode::Char(key)));
+
+            let Some(Overlay::McpSearch(picker)) = &app.overlay else {
+                panic!("{key} in the {} lens opened {:?}", lens.label(), app.overlay.is_some())
+            };
+            assert_eq!(picker.recommended, 9);
+        }
+    }
+
+    /// The palette is the map of everything the program does, so nothing may be
+    /// reachable only through a lens you have to have already found.
+    #[test]
+    fn finding_an_mcp_server_is_in_the_palette_from_every_lens() {
+        for lens in LENSES {
+            let mut app = scene();
+            app.lens = lens;
+
+            let palette = CommandPalette::new(&app);
+            let found = palette
+                .entries
+                .iter()
+                .find(|action| **action == Action::McpFind)
+                .unwrap_or_else(|| panic!("no way to find a server from {lens:?}"));
+            assert!(found.unavailable(&app).is_none(), "offered but blocked from {lens:?}");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_stores_no_mcp_servers_is_not_offered_the_picker() {
         let mut app = scene();
         app.agents[0].capabilities.mcp = false;
 
-        let refusal = Action::Registry.unavailable(&app).expect("the registry was offered anyway");
+        let refusal = Action::McpFind.unavailable(&app).expect("the picker was offered anyway");
         assert!(refusal.contains("does not store MCP servers"), "{refusal}");
     }
 
@@ -6411,29 +6764,49 @@ mod render_tests {
         let mut app = scene();
         app.lens = Lens::Mcp;
         // Refused before any write is attempted, so this touches no config.
-        app.install_registry(&registry_entries()[2]);
+        app.install_candidate(&Candidate::Registry(registry_entries()[2].clone()), Scope::Selected);
 
         assert_eq!(app.status.tone, Tone::Bad);
         assert!(app.status.text.contains("lists no way to run it"), "{:?}", app.status.text);
     }
 
     #[test]
-    fn the_registry_picker_draws_its_rows_and_offers_the_way_back_out() {
+    fn the_picker_shows_both_sources_side_by_side_and_the_way_back_out() {
         let mut app = scene();
         app.lens = Lens::Mcp;
-        app.overlay =
-            Some(Overlay::Registry(RegistryPicker::new(String::new(), registry_entries())));
+        let mut picker = mcp_search();
+        picker.answered("files", registry_entries());
+        app.overlay = Some(Overlay::McpSearch(picker));
 
-        let text = screen(&mut app, 120, 30);
-        assert!(text.contains("mcp registry"), "no title:\n{text}");
-        assert!(text.contains("io.github.example/filesystem"), "no rows:\n{text}");
-        // Truncated to its column, so match the head of it rather than the whole.
-        assert!(text.contains("npx -y server-filesyste"), "no launch summary:\n{text}");
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("mcp servers"), "no title:\n{text}");
+        // Both sides are on screen at once, each saying which it is.
+        assert!(text.contains("recommended"), "the curated side is unmarked:\n{text}");
+        assert!(text.contains("registry"), "the registry side is unmarked:\n{text}");
+        assert!(text.contains(STAR), "nothing is marked as recommended:\n{text}");
+        assert!(text.contains("context7"), "no preset rows:\n{text}");
+        // Truncated to its column, so match the head rather than the whole name.
+        assert!(text.contains("io.github.example/filesys"), "no registry rows:\n{text}");
         assert!(text.contains("nothing installable"), "an unrunnable entry is unmarked:\n{text}");
         // Both jobs of the query line are on screen, since one of them costs a
         // request and the user has to know which.
-        assert!(text.contains("ctrl+r search registry"), "no way to re-query:\n{text}");
+        assert!(text.contains("ctrl+r ask the registry"), "no way to query:\n{text}");
         assert!(text.contains("enter install"), "no way to install:\n{text}");
+    }
+
+    #[test]
+    fn a_wide_terminal_leaves_the_description_room_to_be_read() {
+        let mut app = scene();
+        app.lens = Lens::Mcp;
+        app.overlay = Some(Overlay::McpSearch(mcp_search()));
+
+        // The description is the column you choose by, so it must survive whole
+        // wherever there is width for it.
+        let text = screen(&mut app, 140, 40);
+        assert!(
+            text.contains("Up-to-date library and framework documentation"),
+            "the description was cut on a terminal with room to spare:\n{text}"
+        );
     }
 
     #[test]
@@ -6443,7 +6816,7 @@ mod render_tests {
 
         // The five the CLI had and this view did not.
         for action in
-            [Action::Registry, Action::Undo, Action::Doctor, Action::Update, Action::EditConfig]
+            [Action::McpFind, Action::Undo, Action::Doctor, Action::Update, Action::EditConfig]
         {
             assert!(
                 catalogue.contains(&action),
@@ -6469,16 +6842,21 @@ mod render_tests {
     }
 
     #[test]
-    fn the_registry_is_offered_only_where_mcp_servers_live() {
+    fn the_mcp_lens_offers_one_way_to_find_a_server() {
         let mut app = scene();
         app.lens = Lens::Mcp;
         app.focus = Pane::Providers;
         let mcp = screen(&mut app, 150, 30);
-        assert!(mcp.contains("g registry"), "no registry hint on the mcp lens:\n{mcp}");
 
+        // One hint, both keys, and nothing that reads as a second screen.
+        assert!(mcp.contains("p or g find"), "no way in from the mcp lens:\n{mcp}");
+        assert_eq!(mcp.matches(" find").count(), 1, "two doors on the bar again:\n{mcp}");
+
+        // The providers lens keeps `p` for endpoint presets; `g` still reaches
+        // the picker there, it is simply not what that bar is about.
         app.lens = Lens::Providers;
         let providers = screen(&mut app, 150, 30);
-        assert!(!providers.contains("g registry"), "registry offered on providers:\n{providers}");
+        assert!(providers.contains("p preset"), "no preset hint on providers:\n{providers}");
     }
 
     #[test]
@@ -6952,6 +7330,14 @@ mod render_tests {
         for (width, height) in [(60, 12), (80, 20), (200, 60)] {
             let text = screen(&mut scene(), width, height);
             assert!(!text.trim().is_empty(), "{width}x{height} drew nothing");
+
+            // The widest panel there is, asked for more room than it can have.
+            let mut app = scene();
+            let mut picker = mcp_search();
+            picker.answered("files", registry_entries());
+            app.overlay = Some(Overlay::McpSearch(picker));
+            let text = screen(&mut app, width, height);
+            assert!(text.contains(STAR), "the picker vanished at {width}x{height}:\n{text}");
         }
     }
 }
@@ -7382,7 +7768,9 @@ mod tests {
 
         assert!(!hits.is_empty(), "typing mcp must find something");
         assert!(hits.iter().any(|label| label == "add mcp server"), "{hits:?}");
-        assert!(hits.iter().any(|label| label.contains("mcp preset")), "{hits:?}");
+        // The way to both the presets and the registry, under the intent rather
+        // than under either source's name.
+        assert!(hits.iter().any(|label| label == "find an mcp server"), "{hits:?}");
     }
 
     #[test]
@@ -7584,10 +7972,18 @@ mod tests {
             (Action::Delete, Action::McpDelete),
             (Action::Check, Action::McpCheck),
             (Action::CheckAll, Action::McpCheckAll),
-            (Action::Preset(None), Action::McpPreset(None)),
         ] {
             assert_eq!(binding(providers.clone()), binding(mcp.clone()), "{providers:?}");
         }
+
+        // `p` opens the way to add one of whatever the pane is listing: a
+        // provider preset on one side, an MCP server on the other. The MCP side
+        // answers to a second key as well, because that is where the registry
+        // used to live and that habit is worth keeping.
+        assert!(
+            binding(Action::McpFind).starts_with(&binding(Action::Preset(None))),
+            "p stopped meaning the same thing across the two lenses"
+        );
 
         // Every MCP action is on the help screen's second table.
         for action in mcp_menu() {
